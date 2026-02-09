@@ -128,9 +128,6 @@ sudo ip link set pico0 down 2>/dev/null || true
 sudo rmmod pico_usb_wifi
 ```
 
-> **⚠️ Important:** If the module says “in use”, a process may still hold the netdev.  
-> Try bringing the interface down and stopping NetworkManager traffic (see Troubleshooting).
-
 ---
 
 ## Control Plane (debugfs)
@@ -148,7 +145,7 @@ ls -l /sys/kernel/debug/ | grep pico || true
 ls -l /sys/kernel/debug/pico_usb_wifi/ || true
 ```
 
-Expected files (names may vary by implementation):
+Expected files:
 - `scan_start`
 - `scan_results`
 - `scan_done`
@@ -217,11 +214,4 @@ ping -c 4 google.com
 ### Inspect traffic (optional)
 ```bash
 sudo tcpdump -i pico0 -n
-```
-
-6) **Data plane**
-```bash
-sudo ip link set pico0 up
-sudo dhclient -v pico0
-ping -c 4 8.8.8.8
 ```
