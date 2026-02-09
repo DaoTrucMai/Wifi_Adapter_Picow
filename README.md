@@ -5,23 +5,6 @@ Turn a **Raspberry Pi Pico W** into a **USB Wi-Fi adapter** for Linux using a **
 - **Pico W firmware** handles Wi-Fi (scan / connect / disconnect / status + data plane).
 - **Linux host kernel driver** communicates with Pico over **USB (TinyUSB vendor endpoints)**.
 
-> **⚠️ Note:** This is a research/thesis project. Expect rough edges. See [Troubleshooting](#troubleshooting) if something looks “stuck”.
-
----
-
-## Table of Contents
-- [Project Overview](#project-overview)
-- [Repository Layout](#repository-layout)
-- [Requirements](#requirements)
-- [Build & Flash Pico W Firmware](#build--flash-pico-w-firmware)
-- [Build & Load Linux Kernel Driver](#build--load-linux-kernel-driver)
-- [Control Plane (debugfs)](#control-plane-debugfs)
-- [Data Plane (DHCP + Ping)](#data-plane-dhcp--ping)
-- [Testing Checklist](#testing-checklist)
-- [Troubleshooting](#troubleshooting)
-- [Roadmap](#roadmap)
-- [License](#license)
-
 ---
 
 ## Project Overview
