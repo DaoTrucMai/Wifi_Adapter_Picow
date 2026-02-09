@@ -1,0 +1,31 @@
+# CMake
+**/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+# Makefile
+
+# Pico SDK
+*.uf2
+*.elf
+*.map
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+
+# Kernel driver build artifacts 🔧
+# Ignore generated modules, object files, and build-related files from the kernel build
+**/Module.symvers
+**/modules.order
+**/*.ko
+**/*.o
+**/*.mod
+**/*.mod.c
+**/*.mod.o
+**/*.cmd
