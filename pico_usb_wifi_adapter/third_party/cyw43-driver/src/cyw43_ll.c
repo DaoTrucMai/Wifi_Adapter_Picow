@@ -39,6 +39,13 @@
 #include <stddef.h>
 #include <string.h>
 
+static int cyw43_ll_pmk_mode = -1;
+
+void cyw43_ll_set_pmk_mode(cyw43_ll_t* self, bool is_pmk) {
+    (void)self;
+    cyw43_ll_pmk_mode = is_pmk ? 1 : 0;
+}
+
 #include "cyw43_config.h"
 #include "cyw43_country.h"
 #include "cyw43_internal.h"
@@ -2116,7 +2123,32 @@ int cyw43_ll_wifi_join(cyw43_ll_t* self_in, size_t ssid_len, const uint8_t* ssid
     if (auth_type != CYW43_AUTH_OPEN && auth_type != CYW43_AUTH_WPA3_SAE_AES_PSK) {
         // wwd_wifi_set_passphrase
         cyw43_put_le16(buf, key_len);
-        cyw43_put_le16(buf + 2, 1);
+        /*
+         * WLC_SET_WSEC_PMK accepts either:
+         * - a WPA/WPA2 passphrase (8..63 ASCII) with "passphrase" flag set
+         * - a raw 32-byte PMK with the flag cleared
+         *
+         * For wpa_supplicant/cfg80211, userspace provides the PMK (binary).
+         * For our debugfs path, we usually provide the ASCII passphrase.
+         */
+        {
+            uint16_t passphrase = 1;
+            if (cyw43_ll_pmk_mode >= 0) {
+                passphrase = cyw43_ll_pmk_mode ? 0 : 1;
+            } else {
+                bool looks_binary = false;
+                size_t i;
+                for (i = 0; i < key_len; i++) {
+                    uint8_t c = key[i];
+                    if (c < 0x20 || c > 0x7e) {
+                        looks_binary = true;
+                        break;
+                    }
+                }
+                passphrase = (key_len == 32 && looks_binary) ? 0 : 1;
+            }
+            cyw43_put_le16(buf + 2, passphrase);
+        }
         memcpy(buf + 4, key, key_len);
         cyw43_delay_ms(2);  // Delay required to allow radio firmware to be ready to receive PMK and avoid intermittent failure
 

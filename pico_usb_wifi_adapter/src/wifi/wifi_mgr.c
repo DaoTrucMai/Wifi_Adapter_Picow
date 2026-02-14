@@ -6,6 +6,7 @@
 #include "cyw43.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+#include "pwusb_debug.h"
 #include "pwusb_proto.h"
 
 static msg_queue_t* g_txq = NULL;
@@ -18,6 +19,7 @@ static uint8_t g_ssid_len = 0;
 static uint8_t g_ssid[32] = {0};
 static uint8_t g_psk_len = 0;
 static uint8_t g_psk[64] = {0};
+static uint8_t g_key_type = PWUSB_KEY_NONE;
 static bool g_conn_in_progress = false;
 static bool g_conn_done_sent = false;
 static uint16_t g_conn_seq = 0;
@@ -28,8 +30,8 @@ static absolute_time_t g_conn_deadline = {0};
 
 // Debug override: hardcode credentials for bring-up
 #define DEBUG_WIFI_CREDENTIALS 0
-#define DEBUG_WIFI_SSID "caovietduong"
-#define DEBUG_WIFI_PSK "12345678"
+#define DEBUG_WIFI_SSID "YOUR_SSID"
+#define DEBUG_WIFI_PSK "YOUR_PASSWORD"
 
 static bool parse_dhcp4(const uint8_t* frame, uint16_t len,
                         uint16_t* sport, uint16_t* dport,
@@ -168,7 +170,9 @@ static int scan_cb(void* env, const cyw43_ev_scan_result_t* res) {
     memcpy(rh.bssid, res->bssid, 6);
     rh.channel = (uint8_t)res->channel;
     rh.rssi_dbm = (int8_t)res->rssi;
-    rh.security_flags = 0;  // keep v0.1 simple (you can map auth later)
+    // Expose auth mode so the Linux cfg80211 side can advertise RSN/WPA in scan results.
+    // cyw43 scan results store auth_mode as a small code (0=open, 2=WPA-TKIP, 4=WPA2-AES, 6=WPA2 mixed).
+    rh.security_flags = (uint16_t)res->auth_mode;
     rh.ssid_len = (res->ssid_len > 32) ? 32 : (uint8_t)res->ssid_len;
 
     memcpy(payload, &rh, sizeof(rh));
@@ -230,7 +234,7 @@ bool wifi_mgr_send_ethernet(const uint8_t* buf, uint16_t len) {
     if (len > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) return false;
     if (!g_connected) {
         static uint32_t tx_dbg;
-        if (tx_dbg < 5) {
+        if (PWUSB_WIFI_DEBUG && tx_dbg < 5) {
             printf("TX_ETH drop: not connected len=%u\n", (unsigned)len);
             tx_dbg++;
         }
@@ -240,7 +244,7 @@ bool wifi_mgr_send_ethernet(const uint8_t* buf, uint16_t len) {
     ret = cyw43_send_ethernet(&cyw43_state, CYW43_ITF_STA, len, buf, false);
     {
         static uint32_t tx_dbg;
-        if (tx_dbg < 5) {
+        if (PWUSB_WIFI_DEBUG && tx_dbg < 5) {
             if (ret == 0)
                 printf("TX_ETH ok len=%u\n", (unsigned)len);
             else
@@ -276,7 +280,8 @@ bool wifi_mgr_scan_start(msg_queue_t* txq, uint16_t seq) {
 
 bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
                       const char* ssid, uint8_t ssid_len,
-                      const char* psk, uint8_t psk_len) {
+                      const char* psk, uint8_t psk_len,
+                      uint8_t key_type) {
     phtm_status_rsp_t st;
     int err;
 
@@ -289,6 +294,7 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
     memset(g_psk, 0, sizeof(g_psk));
     memcpy(g_ssid, DEBUG_WIFI_SSID, g_ssid_len);
     memcpy(g_psk, DEBUG_WIFI_PSK, g_psk_len);
+    g_key_type = PWUSB_KEY_PASSPHRASE;
 #else
     g_ssid_len = (ssid_len > 32) ? 32 : ssid_len;
     memset(g_ssid, 0, sizeof(g_ssid));
@@ -298,18 +304,26 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
     memset(g_psk, 0, sizeof(g_psk));
     if (psk && g_psk_len)
         memcpy(g_psk, psk, g_psk_len);
+    g_key_type = (key_type <= PWUSB_KEY_PMK) ? key_type : PWUSB_KEY_NONE;
 #endif
 
-    {
+    if (PWUSB_WIFI_DEBUG) {
         char psk_mask[80];
-        mask_psk(psk_mask, sizeof(psk_mask), g_psk, g_psk_len);
-        printf("CONNECT req: ssid_len=%u psk_len=%u ssid='%s' psk='%s'\n",
-               g_ssid_len, g_psk_len, g_ssid, psk_mask);
+        if (g_key_type == PWUSB_KEY_PMK) {
+            // PMK is binary; don't print raw bytes to UART/logs.
+            snprintf(psk_mask, sizeof(psk_mask), "<pmk:%u bytes>", (unsigned)g_psk_len);
+        } else {
+            mask_psk(psk_mask, sizeof(psk_mask), g_psk, g_psk_len);
+        }
+        printf("CONNECT req: ssid_len=%u psk_len=%u key_type=%u ssid='%s' psk='%s'\n",
+               g_ssid_len, g_psk_len, g_key_type, g_ssid, psk_mask);
     }
 
     g_conn_in_progress = true;
     g_conn_done_sent = false;
     g_conn_deadline = make_timeout_time_ms(CONNECT_TIMEOUT_MS);
+
+    cyw43_ll_set_pmk_mode(&cyw43_state.cyw43_ll, g_key_type == PWUSB_KEY_PMK);
 
     if (g_psk_len) {
         err = cyw43_wifi_join(&cyw43_state, g_ssid_len, g_ssid,
@@ -348,10 +362,12 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
         // No need to register multicast groups since DHCP uses broadcast/unicast only
         uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
         cyw43_wifi_update_multicast_filter(&cyw43_state, bcast, true);
-        printf("multicast filter: allow broadcast (for DHCP OFFER/ACK)\n");
+        if (PWUSB_WIFI_DEBUG)
+            printf("multicast filter: allow broadcast (for DHCP OFFER/ACK)\n");
     }
 
-    printf("CONNECT rc=%d\n", err);
+    if (PWUSB_WIFI_DEBUG)
+        printf("CONNECT rc=%d\n", err);
 
     g_conn_in_progress = false;
     g_conn_done_sent = true;
@@ -401,7 +417,7 @@ void cyw43_cb_process_ethernet(void* cb_data, int itf, size_t len, const uint8_t
     if (!g_txq || !buf || len == 0) return;
     if (len > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) return;
 
-    if (rx_dbg < 10) {
+    if (PWUSB_WIFI_DEBUG && rx_dbg < 10) {
         uint16_t et = (uint16_t)(buf[12] << 8 | buf[13]);
         printf("RX_ETH len=%u et=0x%04x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x\n",
                (unsigned)len, et,
@@ -410,24 +426,12 @@ void cyw43_cb_process_ethernet(void* cb_data, int itf, size_t len, const uint8_t
         rx_dbg++;
     }
 
-    if (parse_dhcp4(buf, (uint16_t)len, &sport, &dport, sip, dip)) {
-        if (dhcp_dbg < 10) {
-            printf("RX DHCP4 %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len=%u\n",
-                   sip[0], sip[1], sip[2], sip[3], sport,
-                   dip[0], dip[1], dip[2], dip[3], dport,
-                   (unsigned)len);
-            dhcp_dbg++;
-        }
-    } else {
-        // Log non-DHCP packets for analysis
-        static uint32_t other_dbg;
-        if (other_dbg < 5 && parse_dhcp4(buf, (uint16_t)len, &sport, &dport, sip, dip) == false) {
-            uint16_t et = (uint16_t)(buf[12] << 8 | buf[13]);
-            if (et != 0x0800) {  // Not IPv4
-                // Log but don't spam
-            }
-            other_dbg++;
-        }
+    if (PWUSB_DHCP_DEBUG && parse_dhcp4(buf, (uint16_t)len, &sport, &dport, sip, dip) && dhcp_dbg < 10) {
+        printf("RX DHCP4 %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len=%u\n",
+               sip[0], sip[1], sip[2], sip[3], sport,
+               dip[0], dip[1], dip[2], dip[3], dport,
+               (unsigned)len);
+        dhcp_dbg++;
     }
 
     hdr.magic = PWUSB_MAGIC;
@@ -447,7 +451,7 @@ void cyw43_cb_process_ethernet(void* cb_data, int itf, size_t len, const uint8_t
         if (!mq_drop(g_txq))
             break;
     }
-    if (push_fail_dbg < 5) {
+    if (PWUSB_WIFI_DEBUG && push_fail_dbg < 5) {
         printf("RX enqueue drop len=%u (queue full)\n", (unsigned)len);
         push_fail_dbg++;
     }
@@ -457,7 +461,7 @@ void cyw43_cb_tcpip_set_link_up(cyw43_t* self, int itf) {
     static uint32_t link_dbg;
     (void)self;
     (void)itf;
-    if (link_dbg < 5) {
+    if (PWUSB_WIFI_DEBUG && link_dbg < 5) {
         printf("TCPIP link up (no lwIP)\n");
         link_dbg++;
     }
@@ -467,7 +471,7 @@ void cyw43_cb_tcpip_set_link_down(cyw43_t* self, int itf) {
     static uint32_t link_dbg;
     (void)self;
     (void)itf;
-    if (link_dbg < 5) {
+    if (PWUSB_WIFI_DEBUG && link_dbg < 5) {
         printf("TCPIP link down (no lwIP)\n");
         link_dbg++;
     }

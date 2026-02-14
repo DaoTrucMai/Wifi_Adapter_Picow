@@ -6,6 +6,11 @@ project(pico_usb_wifi_adapter C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+# Optional firmware debug logs (all OFF by default).
+option(PWUSB_USB_DEBUG "Enable verbose USB transport logs" OFF)
+option(PWUSB_WIFI_DEBUG "Enable verbose Wi-Fi manager logs" OFF)
+option(PWUSB_DHCP_DEBUG "Enable DHCP packet tracing logs" OFF)
+
 set(PICO_CYW43_DRIVER_PATH ${CMAKE_CURRENT_LIST_DIR}/third_party/cyw43-driver)
 
 pico_sdk_init()
@@ -42,5 +47,15 @@ target_compile_definitions(pico_usb_wifi_adapter PRIVATE
     CFG_TUSB_CONFIG_FILE=\"tusb_config.h\"
     CYW43_LWIP=0
 )
+
+if (PWUSB_USB_DEBUG)
+    target_compile_definitions(pico_usb_wifi_adapter PRIVATE PWUSB_USB_DEBUG=1)
+endif()
+if (PWUSB_WIFI_DEBUG)
+    target_compile_definitions(pico_usb_wifi_adapter PRIVATE PWUSB_WIFI_DEBUG=1)
+endif()
+if (PWUSB_DHCP_DEBUG)
+    target_compile_definitions(pico_usb_wifi_adapter PRIVATE PWUSB_DHCP_DEBUG=1)
+endif()
 
 pico_add_extra_outputs(pico_usb_wifi_adapter)

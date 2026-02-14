@@ -30,6 +30,12 @@ enum pwusb_flags {
     PWUSB_F_IS_RESPONSE = 1 << 1,
 };
 
+enum pwusb_key_type {
+    PWUSB_KEY_NONE = 0,
+    PWUSB_KEY_PASSPHRASE = 1,
+    PWUSB_KEY_PMK = 2,
+};
+
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;
@@ -44,6 +50,7 @@ typedef struct {
 
 typedef struct {
     uint8_t ssid_len;
+    uint8_t key_type;
     uint8_t psk_len;
     uint8_t ssid[32];
     uint8_t psk[64];

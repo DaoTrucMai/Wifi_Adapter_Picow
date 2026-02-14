@@ -14,7 +14,8 @@ void wifi_mgr_poll(void);
 bool wifi_mgr_scan_start(msg_queue_t* txq, uint16_t seq);
 bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
                       const char* ssid, uint8_t ssid_len,
-                      const char* psk, uint8_t psk_len);
+                      const char* psk, uint8_t psk_len,
+                      uint8_t key_type);
 bool wifi_mgr_disconnect(msg_queue_t* txq, uint16_t seq);
 void wifi_mgr_get_status(msg_queue_t* txq, uint16_t seq);
 bool wifi_mgr_send_ethernet(const uint8_t* buf, uint16_t len);

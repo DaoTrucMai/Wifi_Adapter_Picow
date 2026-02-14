@@ -19,6 +19,19 @@
 - Logs are printed via Pico UART (not USB CDC).
 - Default Pico SDK stdio UART is typically UART0 on GPIO0/1 at 115200 baud (unless you changed it).
 
+## Enable firmware debug logs (when debugging)
+Firmware logs are compile-time controlled via `pico_usb_wifi_adapter/include/pwusb_debug.h`.
+
+Recommended (CMake options):
+mkdir -p build
+cd build
+cmake .. -DPICO_BOARD=pico_w -DPWUSB_USB_DEBUG=ON -DPWUSB_WIFI_DEBUG=ON -DPWUSB_DHCP_DEBUG=ON
+make -j4
+
+Notes:
+- Keep these OFF for normal runs (DHCP tracing is noisy).
+- If you prefer, you can edit `pico_usb_wifi_adapter/include/pwusb_debug.h` defaults instead.
+
 ## cyw43-driver (vendored)
 This project vendors `cyw43-driver` under `third_party/cyw43-driver` and
 points `PICO_CYW43_DRIVER_PATH` to it. This keeps your system SDK pristine

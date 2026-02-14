@@ -12,8 +12,8 @@
 
 // Enable Vendor class (bulk IN/OUT)
 #define CFG_TUD_VENDOR 1
-#define CFG_TUD_VENDOR_RX_BUFSIZE 512
-#define CFG_TUD_VENDOR_TX_BUFSIZE 512
+#define CFG_TUD_VENDOR_RX_BUFSIZE 2048
+#define CFG_TUD_VENDOR_TX_BUFSIZE 2048
 
 // Disable other classes for now
 #define CFG_TUD_CDC 0

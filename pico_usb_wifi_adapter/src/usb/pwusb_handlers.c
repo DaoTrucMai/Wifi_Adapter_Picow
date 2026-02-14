@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "msg_queue.h"
+#include "pwusb_debug.h"
 #include "pwusb_proto.h"
 #include "wifi_mgr.h"
 #include "cyw43.h"
@@ -117,29 +118,72 @@ bool pwusb_handle_one(msg_queue_t* txq, const uint8_t* msg, uint16_t msg_len) {
         case PWUSB_CMD_CONNECT: {
             const uint8_t* p = payload;
             uint8_t ssid_len;
+            uint8_t key_type = PWUSB_KEY_NONE;
             uint8_t psk_len;
             const uint8_t* ssid;
             const uint8_t* psk;
-            if (msg_len < sizeof(pwusb_hdr_t) + 1) {
+            uint16_t plen = h->payload_len;
+            uint8_t offset = 0;
+            if (msg_len < sizeof(pwusb_hdr_t) + 2 || plen < 2) {
                 uint32_t st = 1;
                 build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
                 return true;
             }
             ssid_len = p[0];
-            psk_len = (msg_len >= sizeof(pwusb_hdr_t) + 2) ? p[1] : 0;
-            if (ssid_len == 0 || ssid_len > 32 || psk_len > 64 ||
-                msg_len < sizeof(pwusb_hdr_t) + 2 + ssid_len + psk_len) {
+            if (ssid_len == 0 || ssid_len > 32) {
                 uint32_t st = 2;
                 build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
                 return true;
             }
-            ssid = p + 2;
-            psk = ssid + ssid_len;
-            printf("CMD_CONNECT: ssid_len=%u psk_len=%u ssid='%.*s'\n",
-                   ssid_len, psk_len, ssid_len, ssid);
+
+            if (plen >= 3) {
+                uint8_t key_type_new = p[1];
+                uint8_t psk_len_new = p[2];
+                uint16_t need_new = (uint16_t)(3 + ssid_len + psk_len_new);
+                uint16_t need_old = (uint16_t)(2 + ssid_len + p[1]);
+                bool new_ok = (key_type_new <= PWUSB_KEY_PMK) &&
+                              (psk_len_new <= 64) &&
+                              (need_new == plen);
+                bool old_ok = (p[1] <= 64) && (need_old == plen);
+
+                if (new_ok && (!old_ok || key_type_new <= PWUSB_KEY_PMK)) {
+                    key_type = key_type_new;
+                    psk_len = psk_len_new;
+                    offset = 3;
+                    ssid = p + offset;
+                    psk = ssid + ssid_len;
+                } else if (old_ok) {
+                    key_type = (p[1] ? PWUSB_KEY_PASSPHRASE : PWUSB_KEY_NONE);
+                    psk_len = p[1];
+                    offset = 2;
+                    ssid = p + offset;
+                    psk = ssid + ssid_len;
+                } else {
+                    uint32_t st = 3;
+                    build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
+                    return true;
+                }
+            } else {
+                uint32_t st = 3;
+                build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
+                return true;
+            }
+
+            if (psk_len > 64 ||
+                offset == 0 ||
+                plen < (uint16_t)(offset + ssid_len + psk_len)) {
+                uint32_t st = 2;
+                build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
+                return true;
+            }
+            if (PWUSB_WIFI_DEBUG) {
+                printf("CMD_CONNECT: ssid_len=%u psk_len=%u key_type=%u ssid='%.*s'\n",
+                       ssid_len, psk_len, key_type, ssid_len, ssid);
+            }
             wifi_mgr_connect(txq, h->seq,
                              (const char*)ssid, ssid_len,
-                             (const char*)psk, psk_len);
+                             (const char*)psk, psk_len,
+                             key_type);
             return true;
         }
 
@@ -159,20 +203,22 @@ bool pwusb_handle_one(msg_queue_t* txq, const uint8_t* msg, uint16_t msg_len) {
             uint8_t sip[4] = {0}, dip[4] = {0};
             static uint32_t dhcp_dbg;
             if (h->payload_len > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) {
-                printf("DATA_TX_ETH: len=%u (drop)\n", h->payload_len);
+                if (PWUSB_WIFI_DEBUG)
+                    printf("DATA_TX_ETH: len=%u (drop)\n", h->payload_len);
                 return true;
             }
-            if (parse_dhcp4(payload, h->payload_len, &sport, &dport, sip, dip) && dhcp_dbg < 10) {
+            if (PWUSB_DHCP_DEBUG &&
+                parse_dhcp4(payload, h->payload_len, &sport, &dport, sip, dip) && dhcp_dbg < 10) {
                 printf("TX DHCP4 %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len=%u\n",
                        sip[0], sip[1], sip[2], sip[3], sport,
                        dip[0], dip[1], dip[2], dip[3], dport,
                        h->payload_len);
                 dhcp_dbg++;
             }
-            printf("DATA_TX_ETH rx len=%u\n", h->payload_len);
-            if (!wifi_mgr_send_ethernet(payload, h->payload_len)) {
+            if (PWUSB_WIFI_DEBUG)
+                printf("DATA_TX_ETH rx len=%u\n", h->payload_len);
+            if (!wifi_mgr_send_ethernet(payload, h->payload_len) && PWUSB_WIFI_DEBUG)
                 printf("DATA_TX_ETH: len=%u (send failed)\n", h->payload_len);
-            }
             return true;
         }
 

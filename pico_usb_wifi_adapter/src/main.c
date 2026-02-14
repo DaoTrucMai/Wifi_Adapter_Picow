@@ -8,6 +8,7 @@
 #include "tusb.h"
 #include "usb_device.h"
 #include "wifi_mgr.h"
+#include "pwusb_debug.h"
 
 msg_queue_t g_txq;
 
@@ -41,7 +42,9 @@ int main(void) {
             pwusb_handle_one(&g_txq, rx_msg, rx_len);
         }
 
-        // Drain outbound queue to host
+        // Drain outbound queue to host aggressively to improve throughput.
+        usb_device_try_tx();
+        usb_device_try_tx();
         usb_device_try_tx();
 
         {
@@ -49,7 +52,7 @@ int main(void) {
             if ((int32_t)(now - next_stats_ms) >= 0) {
                 uint32_t drop_bytes = 0, drop_events = 0, resync_bytes = 0;
                 pwusb_transport_get_and_clear_stats(&drop_bytes, &drop_events, &resync_bytes);
-                if (drop_events || resync_bytes) {
+                if (PWUSB_USB_DEBUG && (drop_events || resync_bytes)) {
                     printf("USB RX stats: drop_events=%lu drop_bytes=%lu resync_bytes=%lu\n",
                            (unsigned long)drop_events, (unsigned long)drop_bytes, (unsigned long)resync_bytes);
                 }

@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define MQ_MAX_MSG 2048
-#define MQ_DEPTH 8
+#define MQ_DEPTH 32
 
 typedef struct {
     uint16_t len;
