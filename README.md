@@ -111,6 +111,8 @@ make
 
 ### Load
 ```bash
+sudo modprobe cfg80211
+sudo modprobe mac80211
 sudo insmod pico_usb_wifi.ko
 ```
 
