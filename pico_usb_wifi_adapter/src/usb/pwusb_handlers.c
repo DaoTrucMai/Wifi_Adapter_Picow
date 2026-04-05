@@ -1,86 +1,53 @@
+#include "pwusb_handlers.h"
+
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "msg_queue.h"
 #include "pwusb_debug.h"
+#include "pwusb_perf.h"
 #include "pwusb_proto.h"
 #include "wifi_mgr.h"
 #include "cyw43.h"
 
-static bool parse_dhcp4(const uint8_t* frame, uint16_t len,
-                        uint16_t* sport, uint16_t* dport,
-                        uint8_t sip[4], uint8_t dip[4]) {
-    uint16_t et;
-    uint8_t ihl;
-    uint16_t udp_off;
+// ============================================================
+// Helpers
+// ============================================================
 
-    if (!frame || len < 14 + 20 + 8) return false;
+static bool enqueue_msg(msg_queue_t* txq, uint16_t seq, uint8_t msg_type, const void* payload, uint16_t payload_len) {
+    pwusb_hdr_t h;
+    h.magic = PWUSB_MAGIC;
+    h.version = PWUSB_VERSION;
+    h.msg_type = msg_type;
+    h.flags = 0;
+    h.hdr_len = sizeof(pwusb_hdr_t);
+    h.seq = seq;
+    h.payload_len = payload_len;
+    h.xid = 0;
 
-    et = (uint16_t)((uint16_t)frame[12] << 8 | frame[13]);
-    if (et != 0x0800) return false;
-
-    if ((frame[14] >> 4) != 4) return false;
-    ihl = (uint8_t)((frame[14] & 0x0f) * 4);
-    if (ihl < 20) return false;
-    if (len < (uint16_t)(14 + ihl + 8)) return false;
-    if (frame[23] != 17) return false;  // UDP
-
-    memcpy(sip, frame + 26, 4);
-    memcpy(dip, frame + 30, 4);
-
-    udp_off = (uint16_t)(14 + ihl);
-    *sport = (uint16_t)((uint16_t)frame[udp_off + 0] << 8 | frame[udp_off + 1]);
-    *dport = (uint16_t)((uint16_t)frame[udp_off + 2] << 8 | frame[udp_off + 3]);
-    if (!((*sport == 68 && *dport == 67) || (*sport == 67 && *dport == 68)))
+    if (payload_len > MQ_MAX_MSG - sizeof(pwusb_hdr_t)) {
         return false;
+    }
 
-    return true;
+    return mq_push2(txq, &h, (uint16_t)sizeof(h), payload, payload_len);
 }
 
-static void build_and_enqueue(msg_queue_t* txq, uint8_t type, uint16_t seq,
-                              const void* payload, uint16_t plen) {
-    uint8_t buf[16 + MQ_MAX_MSG];
-    if (plen > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) return;
-
-    pwusb_hdr_t hdr = {
-        .magic = PWUSB_MAGIC,
-        .version = PWUSB_VERSION,
-        .msg_type = type,
-        .flags = PWUSB_F_IS_RESPONSE,
-        .hdr_len = sizeof(pwusb_hdr_t),
-        .seq = seq,
-        .payload_len = plen,
-        .xid = 0};
-    memcpy(buf, &hdr, sizeof(hdr));
-    if (plen && payload) memcpy(buf + sizeof(hdr), payload, plen);
-    mq_push(txq, buf, (uint16_t)(sizeof(hdr) + plen));
+static bool enqueue_empty(msg_queue_t* txq, uint16_t seq, uint8_t msg_type) {
+    return enqueue_msg(txq, seq, msg_type, NULL, 0);
 }
 
-static void build_and_enqueue_raw(msg_queue_t* txq, uint8_t type, uint16_t seq,
-                                  const void* payload, uint16_t plen) {
-    uint8_t buf[16 + MQ_MAX_MSG];
-    if (plen > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) return;
-
-    pwusb_hdr_t hdr = {
-        .magic = PWUSB_MAGIC,
-        .version = PWUSB_VERSION,
-        .msg_type = type,
-        .flags = 0,
-        .hdr_len = sizeof(pwusb_hdr_t),
-        .seq = seq,
-        .payload_len = plen,
-        .xid = 0};
-    memcpy(buf, &hdr, sizeof(hdr));
-    if (plen && payload) memcpy(buf + sizeof(hdr), payload, plen);
-    mq_push(txq, buf, (uint16_t)(sizeof(hdr) + plen));
+static bool enqueue_error(msg_queue_t* txq, uint16_t seq, int32_t code) {
+    phtm_error_evt_t e;
+    memset(&e, 0, sizeof(e));
+    e.code = code;
+    return enqueue_msg(txq, seq, PWUSB_EVT_ERROR, &e, (uint16_t)sizeof(e));
 }
 
-typedef struct __attribute__((packed)) {
-    uint16_t host_max_payload;
-    uint16_t host_rx_queue_depth;
-    uint32_t host_caps;
-} hello_req_t;
+static bool valid_len(uint16_t len, uint16_t need) {
+    return len >= need;
+}
 
 typedef struct __attribute__((packed)) {
     uint16_t dev_max_payload;
@@ -88,144 +55,272 @@ typedef struct __attribute__((packed)) {
     uint32_t dev_caps;
     uint8_t mac[6];
     uint8_t reserved[2];
-} hello_rsp_t;
+} phtm_hello_rsp_t;
 
-bool pwusb_handle_one(msg_queue_t* txq, const uint8_t* msg, uint16_t msg_len) {
-    if (msg_len < sizeof(pwusb_hdr_t)) return false;
+// ============================================================
+// Benchmark state
+// ============================================================
+
+static volatile bool g_bench_src_running = false;   // device -> host
+static volatile bool g_bench_sink_running = false;  // host -> device
+static uint16_t g_bench_plen = 0;
+static uint32_t g_bench_seq = 0;
+
+// Small scratch buffer for generated benchmark messages.
+// total message <= dev_max_total ~= 2048 in your host stats, so keep <= MQ_MAX_MSG.
+static uint8_t g_bench_msg[MQ_MAX_MSG];
+
+bool pwusb_bench_is_active(void) {
+    return g_bench_src_running || g_bench_sink_running;
+}
+
+// Generate PWUSB_DATA_BENCH_SRC messages continuously while source benchmark runs.
+void pwusb_bench_poll(msg_queue_t* txq) {
+    if (!g_bench_src_running) {
+        return;
+    }
+
+    uint16_t max_payload = (uint16_t)(MQ_MAX_MSG - sizeof(pwusb_hdr_t));
+    uint16_t plen = g_bench_plen;
+    if (plen > max_payload) {
+        plen = max_payload;
+    }
+
+    pwusb_hdr_t* h = (pwusb_hdr_t*)g_bench_msg;
+    uint8_t* p = g_bench_msg + sizeof(pwusb_hdr_t);
+
+    // Build one benchmark source message
+    h->magic = PWUSB_MAGIC;
+    h->version = PWUSB_VERSION;
+    h->msg_type = PWUSB_DATA_BENCH_SRC;
+    h->flags = 0;
+    h->hdr_len = sizeof(pwusb_hdr_t);
+    h->seq = (uint16_t)g_bench_seq;
+    h->payload_len = plen;
+    h->xid = 0;
+
+    // Put a sequence number at the start to make payload deterministic/useful
+    if (plen >= 4) {
+        uint32_t seq = g_bench_seq++;
+        memcpy(p, &seq, sizeof(seq));
+        for (uint16_t i = 4; i < plen; i++) {
+            p[i] = (uint8_t)(i + seq);
+        }
+    } else {
+        for (uint16_t i = 0; i < plen; i++) {
+            p[i] = (uint8_t)(i + g_bench_seq);
+        }
+        g_bench_seq++;
+    }
+
+    // If queue is full, do not block; just try again next loop.
+    (void)mq_push(txq, g_bench_msg, (uint16_t)(sizeof(pwusb_hdr_t) + plen));
+}
+
+// ============================================================
+// Main dispatcher
+// ============================================================
+
+void pwusb_handle_one(msg_queue_t* txq, const uint8_t* msg, uint16_t len) {
+    if (!valid_len(len, (uint16_t)sizeof(pwusb_hdr_t))) {
+        (void)enqueue_error(txq, 0, -1);
+        return;
+    }
 
     const pwusb_hdr_t* h = (const pwusb_hdr_t*)msg;
     const uint8_t* payload = msg + sizeof(pwusb_hdr_t);
+    uint16_t payload_len = (uint16_t)(len - sizeof(pwusb_hdr_t));
+
+    if (h->magic != PWUSB_MAGIC) {
+        (void)enqueue_error(txq, h->seq, -2);
+        return;
+    }
+
+    if (h->payload_len != payload_len) {
+        (void)enqueue_error(txq, h->seq, -3);
+        return;
+    }
 
     switch (h->msg_type) {
+        // ----------------------------------------------------
+        // Control plane
+        // ----------------------------------------------------
         case PWUSB_HELLO: {
-            hello_rsp_t rsp = {
-                .dev_max_payload = MQ_MAX_MSG,
-                .dev_tx_queue_depth = MQ_DEPTH,
-                .dev_caps = 0,
-                .mac = {0},
-                .reserved = {0}};
+            phtm_hello_rsp_t rsp = {0};
+            rsp.dev_max_payload = MQ_MAX_MSG;
+            rsp.dev_tx_queue_depth = MQ_DEPTH;
+            rsp.dev_caps = 0;
             cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, rsp.mac);
-            build_and_enqueue(txq, PWUSB_HELLO_RSP, h->seq, &rsp, sizeof(rsp));
-            return true;
+            (void)enqueue_msg(txq, h->seq, PWUSB_HELLO_RSP, &rsp, (uint16_t)sizeof(rsp));
+            break;
         }
 
         case PWUSB_CMD_SCAN_START: {
-            // start scan; results will be queued as events
-            wifi_mgr_scan_start(txq, h->seq);
-            return true;
+            if (!wifi_mgr_scan_start(txq, h->seq)) {
+                (void)enqueue_error(txq, h->seq, -4);
+            }
+            break;
         }
 
         case PWUSB_CMD_CONNECT: {
-            const uint8_t* p = payload;
+            if (!valid_len(payload_len, 2)) {
+                (void)enqueue_error(txq, h->seq, -5);
+                break;
+            }
+
+            char ssid[33] = {0};
+            char pass[65] = {0};
             uint8_t ssid_len;
-            uint8_t key_type = PWUSB_KEY_NONE;
             uint8_t psk_len;
-            const uint8_t* ssid;
-            const uint8_t* psk;
-            uint16_t plen = h->payload_len;
-            uint8_t offset = 0;
-            if (msg_len < sizeof(pwusb_hdr_t) + 2 || plen < 2) {
-                uint32_t st = 1;
-                build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
-                return true;
-            }
-            ssid_len = p[0];
-            if (ssid_len == 0 || ssid_len > 32) {
-                uint32_t st = 2;
-                build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
-                return true;
-            }
+            uint8_t key_type;
+            const uint8_t* ssid_src;
+            const uint8_t* psk_src;
 
-            if (plen >= 3) {
-                uint8_t key_type_new = p[1];
-                uint8_t psk_len_new = p[2];
-                uint16_t need_new = (uint16_t)(3 + ssid_len + psk_len_new);
-                uint16_t need_old = (uint16_t)(2 + ssid_len + p[1]);
-                bool new_ok = (key_type_new <= PWUSB_KEY_PMK) &&
-                              (psk_len_new <= 64) &&
-                              (need_new == plen);
-                bool old_ok = (p[1] <= 64) && (need_old == plen);
-
-                if (new_ok && (!old_ok || key_type_new <= PWUSB_KEY_PMK)) {
-                    key_type = key_type_new;
-                    psk_len = psk_len_new;
-                    offset = 3;
-                    ssid = p + offset;
-                    psk = ssid + ssid_len;
-                } else if (old_ok) {
-                    key_type = (p[1] ? PWUSB_KEY_PASSPHRASE : PWUSB_KEY_NONE);
-                    psk_len = p[1];
-                    offset = 2;
-                    ssid = p + offset;
-                    psk = ssid + ssid_len;
+            if (payload_len == (uint16_t)sizeof(phtm_connect_req_t)) {
+                const phtm_connect_req_t* req = (const phtm_connect_req_t*)payload;
+                ssid_len = req->ssid_len;
+                psk_len = req->psk_len;
+                key_type = req->key_type;
+                ssid_src = req->ssid;
+                psk_src = req->psk;
+            } else if (payload_len >= 3) {
+                uint16_t need_new;
+                ssid_len = payload[0];
+                key_type = payload[1];
+                psk_len = payload[2];
+                need_new = (uint16_t)(3 + ssid_len + psk_len);
+                if (payload_len == need_new) {
+                    ssid_src = payload + 3;
+                    psk_src = payload + 3 + ssid_len;
                 } else {
-                    uint32_t st = 3;
-                    build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
-                    return true;
+                    // Legacy format: [ssid_len][psk_len][ssid...][psk...]
+                    // used by older host drivers before explicit key_type.
+                    uint8_t legacy_psk_len = payload[1];
+                    uint16_t need_old = (uint16_t)(2 + ssid_len + legacy_psk_len);
+                    if (payload_len != need_old) {
+                        (void)enqueue_error(txq, h->seq, -5);
+                        break;
+                    }
+                    psk_len = legacy_psk_len;
+                    key_type = (psk_len > 0) ? PWUSB_KEY_PASSPHRASE : PWUSB_KEY_NONE;
+                    ssid_src = payload + 2;
+                    psk_src = payload + 2 + ssid_len;
                 }
             } else {
-                uint32_t st = 3;
-                build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
-                return true;
+                // payload_len == 2 legacy header only; no room for SSID payload.
+                (void)enqueue_error(txq, h->seq, -5);
+                break;
             }
 
-            if (psk_len > 64 ||
-                offset == 0 ||
-                plen < (uint16_t)(offset + ssid_len + psk_len)) {
-                uint32_t st = 2;
-                build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
-                return true;
+            if (ssid_len == 0 || ssid_len > 32 || psk_len > 64 || key_type > PWUSB_KEY_PMK) {
+                (void)enqueue_error(txq, h->seq, -5);
+                break;
             }
-            if (PWUSB_WIFI_DEBUG) {
-                printf("CMD_CONNECT: ssid_len=%u psk_len=%u key_type=%u ssid='%.*s'\n",
-                       ssid_len, psk_len, key_type, ssid_len, ssid);
+
+            memcpy(ssid, ssid_src, ssid_len);
+            if (psk_len) {
+                memcpy(pass, psk_src, psk_len);
             }
-            wifi_mgr_connect(txq, h->seq,
-                             (const char*)ssid, ssid_len,
-                             (const char*)psk, psk_len,
-                             key_type);
-            return true;
+
+            int rc = wifi_mgr_connect(txq, h->seq,
+                                     ssid, ssid_len,
+                                     pass, psk_len,
+                                     key_type);
+            // wifi_mgr_connect sends PWUSB_EVT_CONN_STATE with status, so no need for additional error here
+            (void)rc; // Suppress unused variable warning
+            break;
         }
 
         case PWUSB_CMD_DISCONNECT: {
-            wifi_mgr_disconnect(txq, h->seq);
-            return true;
+            int rc = wifi_mgr_disconnect(txq, h->seq);
+            // wifi_mgr_disconnect sends PWUSB_EVT_CONN_STATE with status, so no need for additional error here
+            (void)rc; // Suppress unused variable warning
+            break;
         }
 
         case PWUSB_CMD_GET_STATUS: {
             wifi_mgr_get_status(txq, h->seq);
-            return true;
+            break;
+        }
+
+        // ----------------------------------------------------
+        // Raw USB benchmark control plane
+        // ----------------------------------------------------
+        case PWUSB_CMD_BENCH_START: {
+            if (!valid_len(payload_len, (uint16_t)sizeof(phtm_bench_start_req_t))) {
+                (void)enqueue_error(txq, h->seq, -5);
+                break;
+            }
+
+            const phtm_bench_start_req_t* req = (const phtm_bench_start_req_t*)payload;
+            uint16_t plen = req->payload_len;
+            uint16_t max_payload = (uint16_t)(MQ_MAX_MSG - sizeof(pwusb_hdr_t));
+
+            if (plen == 0 || plen > max_payload) {
+                (void)enqueue_error(txq, h->seq, -6);
+                break;
+            }
+
+            g_bench_plen = plen;
+            g_bench_seq = 0;
+
+            // Define direction exactly as host driver expects:
+            // 1 = IN  (device -> host)
+            // 2 = OUT (host -> device sink)
+            // 3 = BOTH
+            switch (req->dir) {
+                case 1:
+                    g_bench_src_running = true;
+                    g_bench_sink_running = false;
+                    break;
+                case 2:
+                    g_bench_src_running = false;
+                    g_bench_sink_running = true;
+                    break;
+                case 3:
+                    g_bench_src_running = true;
+                    g_bench_sink_running = true;
+                    break;
+                default:
+                    (void)enqueue_error(txq, h->seq, -7);
+                    break;
+            }
+
+            break;
+        }
+
+        case PWUSB_CMD_BENCH_STOP: {
+            g_bench_src_running = false;
+            g_bench_sink_running = false;
+            g_bench_plen = 0;
+            break;
+        }
+
+        // ----------------------------------------------------
+        // Data plane
+        // ----------------------------------------------------
+        case PWUSB_DATA_BENCH_SINK: {
+            // Host -> device benchmark payload.
+            // Do not route to Wi-Fi. Just accept it while sink benchmark is active.
+            if (g_bench_sink_running) {
+                // Intentionally do nothing. Host driver already counts bus-side bytes.
+            }
+            break;
         }
 
         case PWUSB_DATA_TX_ETH: {
-            const uint8_t* payload = msg + sizeof(pwusb_hdr_t);
-            uint16_t sport = 0, dport = 0;
-            uint8_t sip[4] = {0}, dip[4] = {0};
-            static uint32_t dhcp_dbg;
-            if (h->payload_len > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) {
-                if (PWUSB_WIFI_DEBUG)
-                    printf("DATA_TX_ETH: len=%u (drop)\n", h->payload_len);
-                return true;
+            // Normal Ethernet TX from host -> Pico Wi-Fi
+            if (payload_len == 0) {
+                break;
             }
-            if (PWUSB_DHCP_DEBUG &&
-                parse_dhcp4(payload, h->payload_len, &sport, &dport, sip, dip) && dhcp_dbg < 10) {
-                printf("TX DHCP4 %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len=%u\n",
-                       sip[0], sip[1], sip[2], sip[3], sport,
-                       dip[0], dip[1], dip[2], dip[3], dport,
-                       h->payload_len);
-                dhcp_dbg++;
+            if (!wifi_mgr_send_ethernet(payload, payload_len)) {
+                (void)enqueue_error(txq, h->seq, -9);
             }
-            if (PWUSB_WIFI_DEBUG)
-                printf("DATA_TX_ETH rx len=%u\n", h->payload_len);
-            if (!wifi_mgr_send_ethernet(payload, h->payload_len) && PWUSB_WIFI_DEBUG)
-                printf("DATA_TX_ETH: len=%u (send failed)\n", h->payload_len);
-            return true;
+            break;
         }
 
-        default: {
-            uint32_t st = 1;  // unknown cmd
-            build_and_enqueue(txq, PWUSB_EVT_ERROR, h->seq, &st, sizeof(st));
-            return true;
-        }
+        default:
+            (void)enqueue_error(txq, h->seq, -8);
+            break;
     }
 }

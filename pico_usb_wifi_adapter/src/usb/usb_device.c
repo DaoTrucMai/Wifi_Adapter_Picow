@@ -2,7 +2,8 @@
 //
 // RX: poll & drain tud_vendor_read() into pwusb_transport_rx_write()
 // TX: pop framed messages from g_txq and stream out via tud_vendor_write()
-//     with safe chunking + reduced busy-wait + sensible flushing.
+//     with bounded batching so USB gets a bit more throughput without starving
+//     the rest of the single-core main loop.
 
 #include <stdio.h>
 #include <string.h>
@@ -31,21 +32,27 @@ enum {
 #define EPNUM_VENDOR_IN  0x81
 
 // ---------- Tunables ----------
-// Size of a chunk used for draining RX FIFO from TinyUSB
 #ifndef USB_RX_CHUNK
-#define USB_RX_CHUNK 512
+#define USB_RX_CHUNK 2048
 #endif
 
-// Max message size that can be popped from msg_queue.
-// IMPORTANT: must be >= your largest framed message (e.g. Ethernet frame packet).
-// If your project already defines a constant for this, replace the value below.
 #ifndef USB_TX_MAX_MSG
 #define USB_TX_MAX_MSG 2048
 #endif
 
-// Optional: avoid spinning too hard when IN FIFO full
 #ifndef USB_TX_SPIN_LIMIT
-#define USB_TX_SPIN_LIMIT 8
+#define USB_TX_SPIN_LIMIT 32
+#endif
+
+// Bounded TX work per call.
+// Keep this moderate so USB gets more done per loop, but Wi-Fi polling still
+// gets CPU time on single-core firmware.
+#ifndef USB_TX_BUDGET_BYTES
+#define USB_TX_BUDGET_BYTES 8192
+#endif
+
+#ifndef USB_TX_BUDGET_MSGS
+#define USB_TX_BUDGET_MSGS 16
 #endif
 
 // ---------- Device descriptor ----------
@@ -74,10 +81,7 @@ uint8_t const* tud_descriptor_device_cb(void) {
 #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
-    // Config: bmAttributes=0x00 (bus powered), MaxPower=100 (200 mA units = 2mA)
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
-
-    // Vendor interface with bulk IN/OUT, EP size 64 (FS)
     TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, 4, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64)
 };
 
@@ -89,7 +93,7 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
 // ---------- String descriptors ----------
 char const* string_desc_arr[] = {
     (const char[]){0x09, 0x04},  // 0: English (0x0409)
-    "MyUniversity",              // 1: Manufacturer
+    "HCMUS",                     // 1: Manufacturer
     "PicoW USB WiFi Adapter",    // 2: Product
     "0001",                      // 3: Serial
     "Vendor Interface",          // 4: Interface string
@@ -123,8 +127,6 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
 }
 
 // ---------- Vendor callbacks ----------
-// We do polling in usb_device_poll_rx() to drain FIFO reliably.
-// Keep callback empty to avoid heavy work in ISR/USB context.
 void tud_vendor_rx_cb(uint8_t itf, uint8_t const* buffer, uint16_t bufsize) {
     (void)itf;
     (void)buffer;
@@ -137,17 +139,14 @@ void usb_device_poll_rx(void) {
 
     static uint8_t buf[USB_RX_CHUNK];
 
-    // Drain everything available from TinyUSB vendor RX FIFO
     while (tud_vendor_available()) {
         uint32_t n = tud_vendor_read(buf, sizeof(buf));
         if (n == 0) break;
-
-        // Feed bytes to transport layer (stream reassembly/parser handles framing)
         pwusb_transport_rx_write(buf, (uint16_t)n);
     }
 }
 
-// ---------- TX path state (kept local to this file) ----------
+// ---------- TX path state ----------
 static uint8_t  s_tx_cur[USB_TX_MAX_MSG];
 static uint16_t s_tx_cur_len = 0;
 static uint16_t s_tx_cur_off = 0;
@@ -157,67 +156,73 @@ static void usb_tx_reset_state(void) {
     s_tx_cur_off = 0;
 }
 
-// ---------- TX function ----------
 void usb_device_try_tx(void) {
     if (!tud_mounted()) {
-        // If USB got unplugged/unmounted, reset state to avoid "stuck message"
         usb_tx_reset_state();
         return;
     }
 
-    // If no current message in-flight, pop a new one from TX queue
-    if (s_tx_cur_len == 0) {
-        uint16_t len = 0;
-        if (!mq_pop(&g_txq, s_tx_cur, &len)) {
-            return; // nothing to send
-        }
-        if (len == 0) {
-            return;
-        }
-        if (len > USB_TX_MAX_MSG) {
-            // Should never happen if queue is configured correctly
-            PWUSB_WARN("usb_device_try_tx: message too large (%u > %u), drop\n",
-                       (unsigned)len, (unsigned)USB_TX_MAX_MSG);
-            return;
-        }
-
-        s_tx_cur_len = len;
-        s_tx_cur_off = 0;
-    }
-
     bool wrote_any = false;
+    uint32_t sent_bytes_this_call = 0;
+    uint32_t sent_msgs_this_call = 0;
     int spin = 0;
 
-    // Stream out as much as possible this call, but avoid infinite spinning
-    while (s_tx_cur_off < s_tx_cur_len) {
-        uint32_t avail = tud_vendor_write_available();
-        if (avail == 0) {
-            // Avoid burning CPU; give up this round
-            if (++spin >= USB_TX_SPIN_LIMIT) break;
-            break;
+    while (sent_bytes_this_call < USB_TX_BUDGET_BYTES &&
+           sent_msgs_this_call < USB_TX_BUDGET_MSGS) {
+
+        if (s_tx_cur_len == 0) {
+            uint16_t len = 0;
+            if (!mq_pop(&g_txq, s_tx_cur, &len)) {
+                break; // queue empty
+            }
+            if (len == 0) {
+                continue;
+            }
+            if (len > USB_TX_MAX_MSG) {
+                PWUSB_WARN("usb_device_try_tx: message too large (%u > %u), drop\n",
+                           (unsigned)len, (unsigned)USB_TX_MAX_MSG);
+                continue;
+            }
+
+            s_tx_cur_len = len;
+            s_tx_cur_off = 0;
         }
 
-        uint32_t remain = (uint32_t)(s_tx_cur_len - s_tx_cur_off);
-        uint32_t chunk  = remain;
-        if (chunk > avail) chunk = avail;
+        while (s_tx_cur_off < s_tx_cur_len) {
+            uint32_t avail = tud_vendor_write_available();
+            if (avail == 0) {
+                if (++spin >= USB_TX_SPIN_LIMIT) {
+                    goto done;
+                }
+                goto done;
+            }
 
-        uint32_t w = tud_vendor_write(s_tx_cur + s_tx_cur_off, chunk);
-        if (w == 0) {
-            // Could not write now; stop and retry later
-            break;
+            uint32_t remain = (uint32_t)(s_tx_cur_len - s_tx_cur_off);
+            uint32_t chunk = remain;
+            if (chunk > avail) chunk = avail;
+
+            uint32_t w = tud_vendor_write(s_tx_cur + s_tx_cur_off, chunk);
+            if (w == 0) {
+                goto done;
+            }
+
+            s_tx_cur_off += (uint16_t)w;
+            sent_bytes_this_call += w;
+            wrote_any = true;
+
+            if (sent_bytes_this_call >= USB_TX_BUDGET_BYTES) {
+                goto done;
+            }
         }
 
-        s_tx_cur_off += (uint16_t)w;
-        wrote_any = true;
+        if (s_tx_cur_off >= s_tx_cur_len) {
+            usb_tx_reset_state();
+            sent_msgs_this_call++;
+        }
     }
 
-    // Low-latency safe behavior: flush whenever we wrote any bytes this round.
-    // This avoids partial-frame stalls when host IN availability is small.
-    if (wrote_any)
+done:
+    if (wrote_any) {
         tud_vendor_flush();
-
-    // If finished sending the whole message, clear state so next call pops new msg
-    if (s_tx_cur_off >= s_tx_cur_len) {
-        usb_tx_reset_state();
     }
 }

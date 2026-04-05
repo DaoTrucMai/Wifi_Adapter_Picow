@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "msg_queue.h"
+#include "pwusb_perf.h"
 #include "pwusb_proto.h"
 #include "ringbuf.h"
 #include "hardware/sync.h"
@@ -11,6 +12,9 @@ static uint8_t g_rx_storage[16384];
 static uint32_t g_drop_bytes;
 static uint32_t g_drop_events;
 static uint32_t g_resync_bytes;
+
+/* Global performance counters */
+pwusb_perf_t g_pwusb_perf = {0};
 
 void pwusb_transport_init(void) {
     ringbuf_init(&g_rx_rb, g_rx_storage, sizeof(g_rx_storage));

@@ -1,13 +1,20 @@
 #include "wifi_mgr.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "cyw43.h"
+#include "cyw43_ll.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include "pwusb_debug.h"
 #include "pwusb_proto.h"
+
+// Forward declaration for internal cyw43 function
+extern void cyw43_ll_set_pmk_mode(cyw43_ll_t *self, bool is_pmk);
+
+static void enqueue_msg_force(uint8_t type, uint16_t seq, const void* payload, uint16_t plen);
 
 static msg_queue_t* g_txq = NULL;
 static uint16_t g_scan_seq = 0;
@@ -28,10 +35,27 @@ static absolute_time_t g_conn_deadline = {0};
 #define SCAN_DONE_TIMEOUT_MS 6000
 #define CONNECT_TIMEOUT_MS 15000
 
+// WiFi debug logging
+
 // Debug override: hardcode credentials for bring-up
 #define DEBUG_WIFI_CREDENTIALS 0
 #define DEBUG_WIFI_SSID "YOUR_SSID"
 #define DEBUG_WIFI_PSK "YOUR_PASSWORD"
+
+static void wifi_debug_send(const char* msg) {
+    if (g_txq) {
+        enqueue_msg_force(PWUSB_EVT_DEBUG, 0, (const uint8_t*)msg, (uint16_t)strlen(msg));
+    }
+}
+
+static void wifi_debug_printf(const char* fmt, ...) {
+    char buf[128];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    wifi_debug_send(buf);
+}
 
 static bool parse_dhcp4(const uint8_t* frame, uint16_t len,
                         uint16_t* sport, uint16_t* dport,
@@ -192,11 +216,11 @@ bool wifi_mgr_init(void) {
     // You can re-enable `CYW43_DEFAULT_PM` later once RX is proven reliable.
     int pm_ret = cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
     if (pm_ret != 0) {
-        printf("WARN: Failed to set PM mode: %d\n", pm_ret);
+        wifi_debug_printf("WARN: Failed to set PM mode: %d\n", pm_ret);
     }
 
     cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, mac);
-    printf("CYW43 MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+    wifi_debug_printf("CYW43 MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return true;
 }
@@ -218,13 +242,15 @@ void wifi_mgr_poll(void) {
     }
 
     if (g_conn_in_progress && !g_conn_done_sent) {
-        phtm_status_rsp_t st;
-        g_connected = false;
-        fill_status(&st);
-        st.reserved = 1;  // timeout
-        enqueue_msg_force(PWUSB_EVT_CONN_STATE, g_conn_seq, &st, sizeof(st));
-        g_conn_done_sent = true;
-        g_conn_in_progress = false;
+        if (absolute_time_diff_us(get_absolute_time(), g_conn_deadline) <= 0) {
+            phtm_status_rsp_t st;
+            g_connected = false;
+            fill_status(&st);
+            st.reserved = 1;  // timeout
+            enqueue_msg_force(PWUSB_EVT_CONN_STATE, g_conn_seq, &st, sizeof(st));
+            g_conn_done_sent = true;
+            g_conn_in_progress = false;
+        }
     }
 }
 
@@ -315,38 +341,54 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
         } else {
             mask_psk(psk_mask, sizeof(psk_mask), g_psk, g_psk_len);
         }
-        printf("CONNECT req: ssid_len=%u psk_len=%u key_type=%u ssid='%s' psk='%s'\n",
+        wifi_debug_printf("CONNECT req: ssid_len=%u psk_len=%u key_type=%u ssid='%s' psk='%s'\n",
                g_ssid_len, g_psk_len, g_key_type, g_ssid, psk_mask);
     }
 
+    g_connected = false;
     g_conn_in_progress = true;
     g_conn_done_sent = false;
     g_conn_deadline = make_timeout_time_ms(CONNECT_TIMEOUT_MS);
 
     cyw43_ll_set_pmk_mode(&cyw43_state.cyw43_ll, g_key_type == PWUSB_KEY_PMK);
 
-    if (g_psk_len) {
-        err = cyw43_wifi_join(&cyw43_state, g_ssid_len, g_ssid,
-                              g_psk_len, g_psk,
-                              CYW43_AUTH_WPA2_MIXED_PSK,
-                              NULL, CYW43_CHANNEL_NONE);
-    } else {
-        err = cyw43_wifi_join(&cyw43_state, g_ssid_len, g_ssid,
-                              0, NULL,
-                              CYW43_AUTH_OPEN,
-                              NULL, CYW43_CHANNEL_NONE);
+    // Map PWUSB key type to CYW43 auth type
+    uint32_t auth_type = CYW43_AUTH_OPEN;
+    switch (g_key_type) {
+        case PWUSB_KEY_PASSPHRASE:
+            auth_type = CYW43_AUTH_WPA2_MIXED_PSK;
+            break;
+        case PWUSB_KEY_PMK:
+            auth_type = CYW43_AUTH_WPA2_MIXED_PSK;  // PMK mode already set above
+            break;
+        case PWUSB_KEY_NONE:
+        default:
+            auth_type = CYW43_AUTH_OPEN;
+            break;
     }
 
+    if (PWUSB_WIFI_DEBUG)
+        wifi_debug_printf("AUTH type selected: %u (key_type=%u, psk_len=%u)\n", (unsigned)auth_type, g_key_type, g_psk_len);
+
+    err = cyw43_wifi_join(&cyw43_state, g_ssid_len, g_ssid,
+                          g_psk_len, g_psk,
+                          auth_type,
+                          NULL, CYW43_CHANNEL_NONE);
+
     if (err == 0) {
+        wifi_debug_printf("Join initiated, polling link status...\n");
         while (!time_reached(g_conn_deadline)) {
             int st = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
-            if (st == CYW43_LINK_JOIN) {
+            wifi_debug_printf("Link status: %d\n", st);
+            if (st == CYW43_LINK_JOIN || st == CYW43_LINK_NOIP || st == CYW43_LINK_UP) {
                 g_connected = true;
                 err = 0;
+                wifi_debug_printf("Connected!\n");
                 break;
             }
             if (st < 0) {
                 err = st;
+                wifi_debug_printf("Link error: %d\n", st);
                 break;
             }
             cyw43_arch_poll();
@@ -363,11 +405,11 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
         uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
         cyw43_wifi_update_multicast_filter(&cyw43_state, bcast, true);
         if (PWUSB_WIFI_DEBUG)
-            printf("multicast filter: allow broadcast (for DHCP OFFER/ACK)\n");
+            wifi_debug_printf("multicast filter: allow broadcast (for DHCP OFFER/ACK)\n");
     }
 
     if (PWUSB_WIFI_DEBUG)
-        printf("CONNECT rc=%d\n", err);
+        wifi_debug_printf("CONNECT rc=%d\n", err);
 
     g_conn_in_progress = false;
     g_conn_done_sent = true;

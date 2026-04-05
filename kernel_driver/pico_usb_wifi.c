@@ -37,6 +37,7 @@
 #define PWUSB_EVT_SCAN_DONE 0x91
 #define PWUSB_EVT_CONN_STATE 0x92
 #define PWUSB_EVT_STATUS 0x93
+#define PWUSB_EVT_DEBUG 0x94
 #define PWUSB_DATA_TX_ETH 0xA0
 #define PWUSB_DATA_RX_ETH 0xA1
 #define PWUSB_EVT_ERROR 0xFF
@@ -457,6 +458,11 @@ static void pico_process_stream(struct pico_dev *pdev, const u8 *data, size_t n)
             dev_info(&pdev->intf->dev, DRV_NAME ": <- STATUS seq=%u plen=%u\n",
                      le16_to_cpu(h.seq), plen);
             pico_handle_status(pdev, pdev->fr_buf + PWU_HDR_LEN, plen);
+        }
+        else if (h.msg_type == PWUSB_EVT_DEBUG)
+        {
+            dev_info(&pdev->intf->dev, DRV_NAME ": <- DEBUG seq=%u plen=%u: %.*s\n",
+                     le16_to_cpu(h.seq), plen, plen, pdev->fr_buf + PWU_HDR_LEN);
         }
         else if (h.msg_type == PWUSB_DATA_RX_ETH)
         {

@@ -29,7 +29,7 @@ static bool pico_perf;
 module_param_named(perf, pico_perf, bool, 0644);
 MODULE_PARM_DESC(perf, "Enable 1 Hz perf summary logging (throughput/drop counters)");
 
-static bool pico_dhcp_force_broadcast;
+static bool pico_dhcp_force_broadcast = true;
 module_param_named(dhcp_force_broadcast, pico_dhcp_force_broadcast, bool, 0644);
 MODULE_PARM_DESC(dhcp_force_broadcast, "Set BOOTP broadcast flag on DHCPDISCOVER (optional)");
 
@@ -76,13 +76,13 @@ MODULE_PARM_DESC(dhcp_force_broadcast, "Set BOOTP broadcast flag on DHCPDISCOVER
 #define PICO_USB_TX_URB_COUNT 16
 // Real data-plane TX (host->device) benefits from batching multiple PWUSB frames
 // into a single URB on Full-Speed USB. This is the per-URB buffer size.
-#define PICO_USB_TX_BUF_SIZE 4096
+#define PICO_USB_TX_BUF_SIZE 8192
 // Bound how many Ethernet frames we pack into one URB to limit latency spikes
 // for interactive traffic (ARP/ICMP/TCP ACKs) while still reducing overhead.
-#define PICO_USB_TX_MAX_PKTS_PER_URB 4
+#define PICO_USB_TX_MAX_PKTS_PER_URB 8
 
 // Limit TX software queue depth (in skbs) to bound memory when USB is backpressured.
-#define PICO_USB_TX_SKB_Q_LIMIT 256
+#define PICO_USB_TX_SKB_Q_LIMIT 512
 
 #define PICO_BENCH_OUT_URB_COUNT 16
 #define PICO_BENCH_OUT_URB_SIZE 8192
@@ -1616,11 +1616,41 @@ static void pico_handle_conn_state(struct pico_dev *pdev, const u8 *payload, siz
 {
     struct phtm_status_rsp st;
     unsigned long flags;
+    bool prev_connected;
+    u8 prev_ssid[32];
+    u8 prev_ssid_len;
 
     if (plen < sizeof(st))
         return;
 
     memcpy(&st, payload, sizeof(st));
+
+    /*
+     * Firmware can occasionally emit a transient "connected=0, st=0"
+     * while userspace is still in the middle of connect flow.
+     * If we already have a healthy link and this is not a user-requested
+     * disconnect, ignore the glitch to avoid NetworkManager false failure.
+     */
+    spin_lock_irqsave(&pdev->scan_lock, flags);
+    prev_connected = pdev->conn_connected;
+    prev_ssid_len = pdev->conn_ssid_len;
+    memcpy(prev_ssid, pdev->conn_ssid, sizeof(prev_ssid));
+    spin_unlock_irqrestore(&pdev->scan_lock, flags);
+
+    if (!st.connected &&
+        le16_to_cpu((__le16)st.reserved) == 0 &&
+        prev_connected &&
+        !pdev->ctrl_quiesce &&
+        st.ssid_len == prev_ssid_len &&
+        st.ssid_len <= sizeof(prev_ssid) &&
+        memcmp(st.ssid, prev_ssid, st.ssid_len) == 0) {
+        if (pico_debug) {
+            dev_info(&pdev->intf->dev,
+                     DRV_NAME ": ignore transient CONN_STATE down (st=0, ssid=\"%.*s\")\n",
+                     st.ssid_len, st.ssid);
+        }
+        return;
+    }
 
     spin_lock_irqsave(&pdev->scan_lock, flags);
     pdev->conn_connected = st.connected ? true : false;

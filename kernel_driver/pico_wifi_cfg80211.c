@@ -204,6 +204,7 @@ static void pico_cfg80211_conn_work(struct work_struct* work) {
 static int pico_cfg80211_scan(struct wiphy* wiphy,
                               struct cfg80211_scan_request* request) {
     struct pico_cfg80211* cfg = wiphy_priv(wiphy);
+    bool connected;
     int ret;
 
     if (!cfg || !cfg->pdev)
@@ -214,8 +215,20 @@ static int pico_cfg80211_scan(struct wiphy* wiphy,
         spin_unlock_bh(&cfg->lock);
         return -EBUSY;
     }
+    connected = cfg->is_connected;
     cfg->scan_req = request;
+    cfg->scan_aborted = false;
     spin_unlock_bh(&cfg->lock);
+
+    /*
+     * CYW43 full scan while already associated can flap the link on this
+     * transport. For bgscan requests from wpa_supplicant/NM, finish quickly
+     * using cached BSS entries instead of triggering device-side scan.
+     */
+    if (connected) {
+        schedule_work(&cfg->scan_done_work);
+        return 0;
+    }
 
     ret = pico_ctrl_scan_start(cfg->pdev);
     if (ret) {
@@ -502,7 +515,9 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
         /* SSID IE + optional RSN/WPA IE */
         u8 ie[2 + 32 + 2 + 24];
         size_t ie_len = 0;
-        bool privacy = (auth_mode & 0x01) != 0;
+        bool has_wpa = (auth_mode & 0x02) != 0;
+        bool has_wpa2 = (auth_mode & 0x04) != 0;
+        bool privacy = auth_mode != 0;
 
         if (ssid_len > 32)
             ssid_len = 32;
@@ -519,7 +534,7 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
          * Firmware scan results only provide a compact auth code.
          * Map the common cases so wpa_supplicant can select WPA/WPA2 networks.
          */
-        if (auth_mode & 0x04) {
+        if (has_wpa2) {
             /* WPA2-PSK-CCMP RSN IE (minimal) */
             static const u8 rsn_ie[] = {
                 WLAN_EID_RSN,
@@ -547,7 +562,7 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
             };
             memcpy(ie + ie_len, rsn_ie, sizeof(rsn_ie));
             ie_len += sizeof(rsn_ie);
-        } else if (auth_mode & 0x02) {
+        } else if (has_wpa) {
             /* WPA-PSK-TKIP vendor IE (minimal) */
             static const u8 wpa_ie[] = {
                 WLAN_EID_VENDOR_SPECIFIC,

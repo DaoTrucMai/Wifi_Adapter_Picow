@@ -22,6 +22,7 @@ typedef struct {
 
 void mq_init(msg_queue_t* mq);
 bool mq_push(msg_queue_t* mq, const uint8_t* data, uint16_t len);
+bool mq_push2(msg_queue_t* mq, const void* data1, uint16_t len1, const void* data2, uint16_t len2);
 bool mq_pop(msg_queue_t* mq, uint8_t* out, uint16_t* out_len);
 // Drops the oldest message without copying it out.
 bool mq_drop(msg_queue_t* mq);

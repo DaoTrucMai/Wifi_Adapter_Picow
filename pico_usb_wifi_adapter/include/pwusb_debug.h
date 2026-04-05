@@ -9,7 +9,7 @@
 #endif
 
 #ifndef PWUSB_WIFI_DEBUG
-#define PWUSB_WIFI_DEBUG 0
+#define PWUSB_WIFI_DEBUG 1
 #endif
 
 #ifndef PWUSB_DHCP_DEBUG
