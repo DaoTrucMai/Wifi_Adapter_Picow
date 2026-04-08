@@ -10,24 +10,19 @@ enum pwusb_msg_type {
     PWUSB_HELLO = 0x01,
     PWUSB_HELLO_RSP = 0x81,
 
-    PWUSB_CMD_SCAN_START  = 0x10,
-    PWUSB_CMD_SCAN_ABORT  = 0x11,
-    PWUSB_CMD_CONNECT     = 0x12,
-    PWUSB_CMD_DISCONNECT  = 0x13,
-    PWUSB_CMD_GET_STATUS  = 0x14,
-    PWUSB_CMD_BENCH_START = 0x20,
-    PWUSB_CMD_BENCH_STOP  = 0x21,
+    PWUSB_CMD_SCAN_START = 0x10,
+    PWUSB_CMD_SCAN_ABORT = 0x11,
+    PWUSB_CMD_CONNECT = 0x12,
+    PWUSB_CMD_DISCONNECT = 0x13,
+    PWUSB_CMD_GET_STATUS = 0x14,
 
     PWUSB_EVT_SCAN_RESULT = 0x90,
-    PWUSB_EVT_SCAN_DONE   = 0x91,
-    PWUSB_EVT_CONN_STATE  = 0x92,
-    PWUSB_EVT_STATUS      = 0x93,
-    PWUSB_EVT_DEBUG       = 0x94,
-    PWUSB_DATA_TX_ETH     = 0xA0,
-    PWUSB_DATA_RX_ETH     = 0xA1,
-    PWUSB_DATA_BENCH_SINK = 0xB0,
-    PWUSB_DATA_BENCH_SRC  = 0xB1,
-    PWUSB_EVT_ERROR       = 0xFF,
+    PWUSB_EVT_SCAN_DONE = 0x91,
+    PWUSB_EVT_CONN_STATE = 0x92,
+    PWUSB_EVT_STATUS = 0x93,
+    PWUSB_DATA_TX_ETH = 0xA0,
+    PWUSB_DATA_RX_ETH = 0xA1,
+    PWUSB_EVT_ERROR = 0xFF,
 };
 
 enum pwusb_flags {
@@ -54,10 +49,6 @@ typedef struct {
 } pwusb_hdr_t;
 
 typedef struct {
-    int32_t code;
-} phtm_error_evt_t;
-
-typedef struct {
     uint8_t ssid_len;
     uint8_t key_type;
     uint8_t psk_len;
@@ -74,11 +65,6 @@ typedef struct {
     int8_t rssi;
     uint16_t reserved;
 } phtm_status_rsp_t;
-
-typedef struct {
-    uint8_t dir;        // bit0: device->host source, bit1: host->device sink
-    uint16_t payload_len;
-} phtm_bench_start_req_t;
 #pragma pack(pop)
 
 #endif

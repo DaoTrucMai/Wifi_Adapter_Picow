@@ -204,7 +204,6 @@ static void pico_cfg80211_conn_work(struct work_struct* work) {
 static int pico_cfg80211_scan(struct wiphy* wiphy,
                               struct cfg80211_scan_request* request) {
     struct pico_cfg80211* cfg = wiphy_priv(wiphy);
-    bool connected;
     int ret;
 
     if (!cfg || !cfg->pdev)
@@ -215,20 +214,8 @@ static int pico_cfg80211_scan(struct wiphy* wiphy,
         spin_unlock_bh(&cfg->lock);
         return -EBUSY;
     }
-    connected = cfg->is_connected;
     cfg->scan_req = request;
-    cfg->scan_aborted = false;
     spin_unlock_bh(&cfg->lock);
-
-    /*
-     * CYW43 full scan while already associated can flap the link on this
-     * transport. For bgscan requests from wpa_supplicant/NM, finish quickly
-     * using cached BSS entries instead of triggering device-side scan.
-     */
-    if (connected) {
-        schedule_work(&cfg->scan_done_work);
-        return 0;
-    }
 
     ret = pico_ctrl_scan_start(cfg->pdev);
     if (ret) {
@@ -342,11 +329,10 @@ static int pico_cfg80211_get_station(struct wiphy* wiphy, struct net_device* dev
 }
 
 static int pico_cfg80211_add_key(struct wiphy* wiphy, struct net_device* dev,
-                                 int link_id, u8 key_index, bool pairwise,
+                                 u8 key_index, bool pairwise,
                                  const u8* mac_addr, struct key_params* params) {
     (void)wiphy;
     (void)dev;
-    (void)link_id;
     (void)key_index;
     (void)pairwise;
     (void)mac_addr;
@@ -360,11 +346,10 @@ static int pico_cfg80211_add_key(struct wiphy* wiphy, struct net_device* dev,
 }
 
 static int pico_cfg80211_del_key(struct wiphy* wiphy, struct net_device* dev,
-                                 int link_id, u8 key_index, bool pairwise,
+                                 u8 key_index, bool pairwise,
                                  const u8* mac_addr) {
     (void)wiphy;
     (void)dev;
-    (void)link_id;
     (void)key_index;
     (void)pairwise;
     (void)mac_addr;
@@ -372,10 +357,9 @@ static int pico_cfg80211_del_key(struct wiphy* wiphy, struct net_device* dev,
 }
 
 static int pico_cfg80211_set_default_key(struct wiphy* wiphy, struct net_device* dev,
-                                         int link_id, u8 key_index, bool unicast, bool multicast) {
+                                         u8 key_index, bool unicast, bool multicast) {
     (void)wiphy;
     (void)dev;
-    (void)link_id;
     (void)key_index;
     (void)unicast;
     (void)multicast;
@@ -383,10 +367,9 @@ static int pico_cfg80211_set_default_key(struct wiphy* wiphy, struct net_device*
 }
 
 static int pico_cfg80211_set_default_mgmt_key(struct wiphy* wiphy, struct net_device* dev,
-                                              int link_id, u8 key_index) {
+                                              u8 key_index) {
     (void)wiphy;
     (void)dev;
-    (void)link_id;
     (void)key_index;
     return 0;
 }
@@ -515,9 +498,7 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
         /* SSID IE + optional RSN/WPA IE */
         u8 ie[2 + 32 + 2 + 24];
         size_t ie_len = 0;
-        bool has_wpa = (auth_mode & 0x02) != 0;
-        bool has_wpa2 = (auth_mode & 0x04) != 0;
-        bool privacy = auth_mode != 0;
+        bool privacy = (auth_mode & 0x01) != 0;
 
         if (ssid_len > 32)
             ssid_len = 32;
@@ -534,7 +515,7 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
          * Firmware scan results only provide a compact auth code.
          * Map the common cases so wpa_supplicant can select WPA/WPA2 networks.
          */
-        if (has_wpa2) {
+        if (auth_mode & 0x04) {
             /* WPA2-PSK-CCMP RSN IE (minimal) */
             static const u8 rsn_ie[] = {
                 WLAN_EID_RSN,
@@ -562,7 +543,7 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
             };
             memcpy(ie + ie_len, rsn_ie, sizeof(rsn_ie));
             ie_len += sizeof(rsn_ie);
-        } else if (has_wpa) {
+        } else if (auth_mode & 0x02) {
             /* WPA-PSK-TKIP vendor IE (minimal) */
             static const u8 wpa_ie[] = {
                 WLAN_EID_VENDOR_SPECIFIC,

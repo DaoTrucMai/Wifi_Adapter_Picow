@@ -28,13 +28,6 @@ add_executable(pico_usb_wifi_adapter
 target_include_directories(pico_usb_wifi_adapter PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}
-    ${CMAKE_CURRENT_LIST_DIR}/third_party/cyw43-driver/src
-    ${PICO_SDK_PATH}/src/common/pico_base/include
-    ${PICO_SDK_PATH}/src/common/pico_sync/include
-    ${PICO_SDK_PATH}/src/rp2_common/pico_cyw43_driver/include
-    ${PICO_SDK_PATH}/src/rp2_common/pico_cyw43_arch/include
-    ${PICO_SDK_PATH}/src/rp2_common/pico_async_context/include
-    ${PICO_SDK_PATH}/lib/cyw43-driver/src
 )
 
 # We keep USB stdio off; we use vendor bulk for protocol.
@@ -53,7 +46,6 @@ target_link_libraries(pico_usb_wifi_adapter
 target_compile_definitions(pico_usb_wifi_adapter PRIVATE
     CFG_TUSB_CONFIG_FILE=\"tusb_config.h\"
     CYW43_LWIP=0
-    PICO_CYW43_ARCH_HEADER=pico/cyw43_arch/arch_poll.h
 )
 
 if (PWUSB_USB_DEBUG)
