@@ -2,11 +2,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cyw43.h"
 #include "msg_queue.h"
 #include "pwusb_debug.h"
+#include "pwusb_perf.h"
 #include "pwusb_proto.h"
+#include "usb_backend.h"
 #include "wifi_mgr.h"
-#include "cyw43.h"
 
 static bool parse_dhcp4(const uint8_t* frame, uint16_t len,
                         uint16_t* sport, uint16_t* dport,
@@ -197,16 +199,45 @@ bool pwusb_handle_one(msg_queue_t* txq, const uint8_t* msg, uint16_t msg_len) {
             return true;
         }
 
+        case PWUSB_CMD_BENCH_START: {
+            // Payload: dir:u8, payload_len:le16
+            // dir bit0: enable device->host source
+            // dir bit1: enable host->device sink fast-drop mode
+            if (h->payload_len >= 3) {
+                uint8_t dir = payload[0];
+                uint16_t plen = (uint16_t)((uint16_t)payload[1] | ((uint16_t)payload[2] << 8));
+                // Treat BENCH_START as authoritative mode selection so the
+                // source/sink state cannot drift when switching between in/out/both.
+                usb_backend_bench_set_src(false, 0);
+                usb_backend_bench_set_sink(false);
+                if (dir & 0x01) {
+                    usb_backend_bench_set_src(true, plen);
+                }
+                if (dir & 0x02) {
+                    usb_backend_bench_set_sink(true);
+                }
+            }
+            return true;
+        }
+
+        case PWUSB_CMD_BENCH_STOP: {
+            usb_backend_bench_set_src(false, 0);
+            usb_backend_bench_set_sink(false);
+            return true;
+        }
+
         case PWUSB_DATA_TX_ETH: {
             const uint8_t* payload = msg + sizeof(pwusb_hdr_t);
             uint16_t sport = 0, dport = 0;
             uint8_t sip[4] = {0}, dip[4] = {0};
             static uint32_t dhcp_dbg;
             if (h->payload_len > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) {
+                pwusb_perf_host_tx_eth_drop_oversize();
                 if (PWUSB_WIFI_DEBUG)
                     printf("DATA_TX_ETH: len=%u (drop)\n", h->payload_len);
                 return true;
             }
+            pwusb_perf_host_tx_eth(h->payload_len);
             if (PWUSB_DHCP_DEBUG &&
                 parse_dhcp4(payload, h->payload_len, &sport, &dport, sip, dip) && dhcp_dbg < 10) {
                 printf("TX DHCP4 %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len=%u\n",
@@ -215,10 +246,15 @@ bool pwusb_handle_one(msg_queue_t* txq, const uint8_t* msg, uint16_t msg_len) {
                        h->payload_len);
                 dhcp_dbg++;
             }
-            if (PWUSB_WIFI_DEBUG)
-                printf("DATA_TX_ETH rx len=%u\n", h->payload_len);
+            // if (PWUSB_WIFI_DEBUG)
+            // printf("DATA_TX_ETH rx len=%u\n", h->payload_len);
             if (!wifi_mgr_send_ethernet(payload, h->payload_len) && PWUSB_WIFI_DEBUG)
                 printf("DATA_TX_ETH: len=%u (send failed)\n", h->payload_len);
+            return true;
+        }
+
+        case PWUSB_DATA_BENCH_SINK: {
+            // Host->device benchmark payload: discard. Host measures throughput.
             return true;
         }
 

@@ -163,6 +163,15 @@ struct pico_dev
     char ctrl_psk[64];
     u8 ctrl_psk_len;
     bool ctrl_quiesce;
+
+    // Benchmark tracking
+    spinlock_t bench_lock;
+    bool bench_running;
+    u64 bench_start_time; // ktime in ns
+    u64 bench_rx_packets;
+    u64 bench_rx_bytes;
+    u64 bench_tx_packets;
+    u64 bench_tx_bytes;
 };
 
 static bool pico_parse_dhcp4(const u8 *frame, size_t len,
@@ -1026,6 +1035,14 @@ static void pico_handle_data_rx(struct pico_dev *pdev, const u8 *payload, size_t
 
     pdev->netdev->stats.rx_packets++;
     pdev->netdev->stats.rx_bytes += plen;
+
+    /* Update benchmark counters if benchmarking is active */
+    spin_lock(&pdev->bench_lock);
+    if (pdev->bench_running) {
+        pdev->bench_rx_packets++;
+        pdev->bench_rx_bytes += plen;
+    }
+    spin_unlock(&pdev->bench_lock);
 }
 
 static netdev_tx_t pico_ndo_start_xmit(struct sk_buff *skb, struct net_device *ndev)
@@ -1170,6 +1187,15 @@ static netdev_tx_t pico_ndo_start_xmit(struct sk_buff *skb, struct net_device *n
 
     ndev->stats.tx_packets++;
     ndev->stats.tx_bytes += skb->len;
+
+    /* Update benchmark counters if benchmarking is active */
+    spin_lock(&pdev->bench_lock);
+    if (pdev->bench_running) {
+        pdev->bench_tx_packets++;
+        pdev->bench_tx_bytes += skb->len;
+    }
+    spin_unlock(&pdev->bench_lock);
+
     dev_kfree_skb_any(skb);
     return NETDEV_TX_OK;
 }
@@ -1449,6 +1475,123 @@ static const struct file_operations pico_dbg_status_fops = {
     .open = simple_open,
 };
 
+/* Benchmark control file operations */
+static ssize_t pico_dbg_bench_control_write(struct file *file,
+                                            const char __user *buf,
+                                            size_t len,
+                                            loff_t *ppos)
+{
+    struct pico_dev *pdev = file->private_data;
+    char kbuf[64];
+    int ret;
+    unsigned long flags;
+
+    if (len >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, len))
+        return -EFAULT;
+
+    kbuf[len] = '\0';
+
+    /* Remove trailing newline/whitespace */
+    while (len > 0 && (kbuf[len-1] == '\n' || kbuf[len-1] == ' '))
+        len--;
+    kbuf[len] = '\0';
+
+    spin_lock_irqsave(&pdev->bench_lock, flags);
+
+    if (strncmp(kbuf, "reset", 5) == 0) {
+        pdev->bench_running = false;
+        pdev->bench_start_time = 0;
+        pdev->bench_rx_packets = 0;
+        pdev->bench_rx_bytes = 0;
+        pdev->bench_tx_packets = 0;
+        pdev->bench_tx_bytes = 0;
+        ret = len;
+    } else if (strncmp(kbuf, "stop", 4) == 0) {
+        pdev->bench_running = false;
+        ret = len;
+    } else if (strncmp(kbuf, "start", 5) == 0 || strncmp(kbuf, "in ", 3) == 0) {
+        pdev->bench_running = true;
+        pdev->bench_start_time = ktime_get_ns();
+        pdev->bench_rx_packets = 0;
+        pdev->bench_rx_bytes = 0;
+        pdev->bench_tx_packets = 0;
+        pdev->bench_tx_bytes = 0;
+        ret = len;
+    } else {
+        ret = -EINVAL;
+    }
+
+    spin_unlock_irqrestore(&pdev->bench_lock, flags);
+    return ret;
+}
+
+static ssize_t pico_dbg_bench_stats_read(struct file *file,
+                                         char __user *buf,
+                                         size_t len,
+                                         loff_t *ppos)
+{
+    struct pico_dev *pdev = file->private_data;
+    char kbuf[256];
+    int n;
+    unsigned long flags;
+    u64 duration_ms, rx_rate_kbps, tx_rate_kbps;
+    bool running;
+    u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
+
+    spin_lock_irqsave(&pdev->bench_lock, flags);
+    running = pdev->bench_running;
+    rx_packets = pdev->bench_rx_packets;
+    rx_bytes = pdev->bench_rx_bytes;
+    tx_packets = pdev->bench_tx_packets;
+    tx_bytes = pdev->bench_tx_bytes;
+
+    if (running) {
+        duration_ms = (ktime_get_ns() - pdev->bench_start_time) / 1000000;
+    } else {
+        duration_ms = 0;
+    }
+    spin_unlock_irqrestore(&pdev->bench_lock, flags);
+
+    if (duration_ms > 0) {
+        rx_rate_kbps = (rx_bytes * 8 * 1000) / (duration_ms * 1024);
+        tx_rate_kbps = (tx_bytes * 8 * 1000) / (duration_ms * 1024);
+    } else {
+        rx_rate_kbps = 0;
+        tx_rate_kbps = 0;
+    }
+
+    n = scnprintf(kbuf, sizeof(kbuf),
+                  "status=%s\n"
+                  "duration_ms=%llu\n"
+                  "rx_packets=%llu\n"
+                  "rx_bytes=%llu\n"
+                  "rx_rate_kbps=%llu\n"
+                  "tx_packets=%llu\n"
+                  "tx_bytes=%llu\n"
+                  "tx_rate_kbps=%llu\n",
+                  running ? "running" : "stopped",
+                  duration_ms,
+                  rx_packets, rx_bytes, rx_rate_kbps,
+                  tx_packets, tx_bytes, tx_rate_kbps);
+
+    return simple_read_from_buffer(buf, len, ppos, kbuf, n);
+}
+
+static const struct file_operations pico_dbg_bench_control_fops = {
+    .owner = THIS_MODULE,
+    .write = pico_dbg_bench_control_write,
+    .open = simple_open,
+};
+
+static const struct file_operations pico_dbg_bench_stats_fops = {
+    .owner = THIS_MODULE,
+    .read = pico_dbg_bench_stats_read,
+    .open = simple_open,
+};
+
 static int pico_probe(struct usb_interface *interface,
                       const struct usb_device_id *id)
 {
@@ -1518,6 +1661,7 @@ static int pico_probe(struct usb_interface *interface,
     pdev->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
     atomic_set(&pdev->tx_busy, 0);
     spin_lock_init(&pdev->scan_lock);
+    spin_lock_init(&pdev->bench_lock);
     pico_scan_clear(pdev);
 
     if (!pdev->rx_buf || !pdev->rx_urb || !pdev->fr_buf || !pdev->tx_buf || !pdev->tx_urb)
@@ -1606,6 +1750,10 @@ static int pico_probe(struct usb_interface *interface,
                             &pico_dbg_disconnect_fops);
         debugfs_create_file("status", 0400, pdev->dbg_dir, pdev,
                             &pico_dbg_status_fops);
+        debugfs_create_file("bench_control", 0200, pdev->dbg_dir, pdev,
+                            &pico_dbg_bench_control_fops);
+        debugfs_create_file("bench_stats", 0400, pdev->dbg_dir, pdev,
+                            &pico_dbg_bench_stats_fops);
     }
     else
     {

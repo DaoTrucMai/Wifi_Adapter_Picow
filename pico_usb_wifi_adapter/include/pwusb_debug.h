@@ -14,4 +14,9 @@
 #define PWUSB_DHCP_DEBUG 0
 #endif
 
+// 1 Hz perf summary (counters, not per-packet logs). Safe to leave ON.
+#ifndef PWUSB_PERF_DEBUG
+#define PWUSB_PERF_DEBUG 0
+#endif
+
 #endif

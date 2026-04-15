@@ -4,13 +4,15 @@
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
-#include <linux/udp.h>
 #include <linux/uaccess.h>
+#include <linux/udp.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
 #include <net/checksum.h>
@@ -21,6 +23,10 @@
 static bool pico_debug;
 module_param_named(debug, pico_debug, bool, 0644);
 MODULE_PARM_DESC(debug, "Enable verbose bring-up logging");
+
+static bool pico_perf;
+module_param_named(perf, pico_perf, bool, 0644);
+MODULE_PARM_DESC(perf, "Enable 1 Hz perf summary logging (throughput/drop counters)");
 
 static bool pico_dhcp_force_broadcast;
 module_param_named(dhcp_force_broadcast, pico_dhcp_force_broadcast, bool, 0644);
@@ -42,13 +48,46 @@ MODULE_PARM_DESC(dhcp_force_broadcast, "Set BOOTP broadcast flag on DHCPDISCOVER
 #define PWUSB_CMD_CONNECT 0x12
 #define PWUSB_CMD_DISCONNECT 0x13
 #define PWUSB_CMD_GET_STATUS 0x14
+#define PWUSB_CMD_BENCH_START 0x20
+#define PWUSB_CMD_BENCH_STOP 0x21
 #define PWUSB_EVT_SCAN_RESULT 0x90
 #define PWUSB_EVT_SCAN_DONE 0x91
 #define PWUSB_EVT_CONN_STATE 0x92
 #define PWUSB_EVT_STATUS 0x93
 #define PWUSB_DATA_TX_ETH 0xA0
 #define PWUSB_DATA_RX_ETH 0xA1
+#define PWUSB_DATA_BENCH_SINK 0xB0
+#define PWUSB_DATA_BENCH_SRC 0xB1
 #define PWUSB_EVT_ERROR 0xFF
+
+// USB and framing buffer sizes. Full-speed bulk maxpacket is 64 bytes, so larger
+// URBs reduce overhead. The framing buffer must be larger than a single URB
+// because USB can split framed messages arbitrarily; we may have partial frame
+// data left in the buffer when appending the next URB.
+// Increase IN transfer size to improve Full-Speed bulk efficiency. This must be
+// paired with sufficient stream-framer buffering for worst-case re-sync.
+// RX URB size for device->host bulk IN path. Larger URBs reduce per-URB overhead
+// on Full-Speed bulk and typically increase effective throughput.
+// Note: this does not affect the benchmark OUT URB size.
+#define PICO_USB_RX_URB_SIZE 32768
+#define PICO_STREAM_FR_CAP 65536  // Must be > RX_URB_SIZE to handle full URB + leftover framing buffer data
+// Keep RX queue depth modest to reduce memory/CPU while still avoiding read gaps.
+#define PICO_USB_RX_URB_COUNT 8
+
+#define PICO_USB_TX_URB_COUNT 16
+// Real data-plane TX (host->device) benefits from batching multiple PWUSB frames
+// into a single URB on Full-Speed USB. This is the per-URB buffer size.
+#define PICO_USB_TX_BUF_SIZE 16384
+// Bound how many Ethernet frames we pack into one URB to limit latency spikes
+// for interactive traffic (ARP/ICMP/TCP ACKs) while still reducing overhead.
+#define PICO_USB_TX_MAX_PKTS_PER_URB 16
+
+// Limit TX software queue depth (in skbs) to bound memory when USB is backpressured.
+#define PICO_USB_TX_SKB_Q_LIMIT 512
+
+#define PICO_BENCH_OUT_URB_COUNT 16
+// Increase OUT URB size to reduce per-URB overhead on USB Full-Speed bulk.
+#define PICO_BENCH_OUT_URB_SIZE 32768
 
 struct pico_scan_result {
     u8 bssid[6];
@@ -96,6 +135,11 @@ struct __packed phtm_hello_rsp {
     u8 reserved[2];
 };
 
+struct __packed phtm_bench_start_req {
+    u8 dir; /* bit0: device->host source, bit1: host->device sink */
+    __le16 payload_len;
+};
+
 struct pico_dev {
     struct usb_device* udev;
     struct usb_interface* intf;
@@ -104,9 +148,9 @@ struct pico_dev {
     u16 ep_in_maxpkt, ep_out_maxpkt;
 
     // RX
-    struct urb* rx_urb;
-    u8* rx_buf;
     size_t rx_buf_size;
+    struct urb* rx_urbs[PICO_USB_RX_URB_COUNT];
+    u8* rx_bufs[PICO_USB_RX_URB_COUNT];
 
     // Stream framer buffer
     u8* fr_buf;
@@ -114,10 +158,13 @@ struct pico_dev {
     size_t fr_cap;
 
     /* TX (async) */
-    struct urb* tx_urb;
-    u8* tx_buf;
-    size_t tx_buf_size;
-    atomic_t tx_busy;
+    spinlock_t tx_lock;
+    struct urb* tx_urbs[PICO_USB_TX_URB_COUNT];
+    u8* tx_bufs[PICO_USB_TX_URB_COUNT];
+    unsigned long tx_busy_map; /* bit i => tx_urbs[i] in-flight */
+    struct sk_buff_head tx_skb_q;
+    u32 tx_skb_q_limit;
+    struct work_struct tx_work;
 
     // Hello state
     bool got_hello;
@@ -146,6 +193,14 @@ struct pico_dev {
     struct net_device* netdev;
     struct pico_cfg80211* cfg;
 
+    /* RX: NAPI + GRO */
+    struct napi_struct napi;
+    struct sk_buff_head rx_skb_q;
+    u32 rx_skb_q_limit;
+
+    // Device capabilities (from HELLO_RSP)
+    u16 dev_max_total;
+
     bool disconnected;
 
     // debug counters
@@ -159,6 +214,26 @@ struct pico_dev {
     u16 last_tx_seq;
     u32 last_tx_total;
 
+    // perf counters (1 Hz summary when module param 'perf=1')
+    struct delayed_work perf_work;
+    u64 perf_usb_rx_urbs;
+    u64 perf_usb_rx_bytes;
+    u64 perf_stream_frames;
+    u64 perf_stream_bad;
+    u64 perf_data_rx_pkts;
+    u64 perf_data_rx_bytes;
+    u64 perf_data_rx_netif_drop;
+    u64 perf_usb_tx_submits;
+    u64 perf_usb_tx_bytes;
+    u64 perf_usb_tx_eagain;
+
+    // snapshot for delta printing
+    u64 perf_last_usb_rx_bytes;
+    u64 perf_last_data_rx_bytes;
+    u64 perf_last_data_rx_netif_drop;
+    u64 perf_last_usb_tx_bytes;
+    u64 perf_last_usb_tx_eagain;
+
     // deferred control path
     struct delayed_work ctrl_work;
     u8 ctrl_cmd;
@@ -168,7 +243,152 @@ struct pico_dev {
     u8 ctrl_psk_len;
     u8 ctrl_key_type;
     bool ctrl_quiesce;
+
+    // USB benchmark stats
+    struct mutex bench_lock; /* protects bench start/stop and resource lifetime */
+
+    bool bench_in_running;
+    unsigned long bench_in_start_j;
+    u64 bench_in_bytes;
+    u64 bench_in_msgs;
+
+    bool bench_out_running;
+    unsigned long bench_out_start_j;
+    u16 bench_out_payload_len;
+    u16 bench_out_eff_payload_len;
+    u16 bench_out_seq;
+    u64 bench_out_bytes;
+    u64 bench_out_urbs_done;
+    u64 bench_out_errs;
+    struct urb* bench_out_urbs[PICO_BENCH_OUT_URB_COUNT];
+    u8* bench_out_bufs[PICO_BENCH_OUT_URB_COUNT];
+    size_t bench_out_len;
 };
+
+static int pico_napi_poll(struct napi_struct* napi, int budget) {
+    struct pico_dev* pdev = container_of(napi, struct pico_dev, napi);
+    int work_done = 0;
+
+    while (work_done < budget) {
+        struct sk_buff* skb = skb_dequeue(&pdev->rx_skb_q);
+
+        if (!skb)
+            break;
+
+        /* GRO reduces per-packet TCP/IP stack overhead under load. */
+        napi_gro_receive(napi, skb);
+
+        work_done++;
+    }
+
+    if (work_done < budget) {
+        napi_complete_done(napi, work_done);
+        /* New packets will re-schedule NAPI from the USB RX path. */
+    }
+
+    return work_done;
+}
+
+static u16 pico_bench_cap_payload(struct pico_dev* pdev, u16 payload_len) {
+    u16 max_plen = payload_len;
+    u16 maxpkt = 0;
+
+    /* Respect device max total message size (header + payload). */
+    if (pdev && pdev->dev_max_total) {
+        u16 dev_max_plen = (pdev->dev_max_total > PWU_HDR_LEN) ? (pdev->dev_max_total - PWU_HDR_LEN) : 0;
+        if (dev_max_plen && max_plen > dev_max_plen)
+            max_plen = dev_max_plen;
+    }
+
+    /* Respect our TX buffer size (we need hdr + payload in a single buffer). */
+    if (max_plen > (u16)(PICO_USB_TX_BUF_SIZE - PWU_HDR_LEN))
+        max_plen = (u16)(PICO_USB_TX_BUF_SIZE - PWU_HDR_LEN);
+
+    /*
+     * Avoid maxpacket-aligned bench frames on bulk IN. With the current
+     * device max total (2048), a requested payload of 2032 produces a 2048-byte
+     * framed message, which is exactly 32 x 64B packets. That leaves the IN
+     * path dependent on perfect ZLP termination and has proven fragile on the
+     * RP2040 backend. Trim by one byte so every framed bench message ends short.
+     */
+    if (pdev && pdev->ep_in_maxpkt)
+        maxpkt = pdev->ep_in_maxpkt;
+    else
+        maxpkt = 64;
+
+    while (max_plen > 0 && ((PWU_HDR_LEN + max_plen) % maxpkt) == 0)
+        max_plen--;
+
+    return max_plen;
+}
+
+static size_t pico_build_bench_out_buf(struct pico_dev* pdev, u8* buf, size_t cap, u16 payload_len) {
+    size_t off = 0;
+    u16 max_payload = payload_len;
+    u16 seq;
+
+    if (!pdev || !buf || cap < PWU_HDR_LEN)
+        return 0;
+
+    /* Respect device max total message size (header + payload). */
+    if (pdev->dev_max_total) {
+        u16 max_plen = (pdev->dev_max_total > PWU_HDR_LEN) ? (pdev->dev_max_total - PWU_HDR_LEN) : 0;
+        if (max_payload > max_plen)
+            max_payload = max_plen;
+    }
+
+    if (!max_payload)
+        return 0;
+
+    seq = pdev->bench_out_seq;
+
+    while (off + PWU_HDR_LEN + (size_t)max_payload <= cap) {
+        struct pwu_hdr h = {
+            .magic = cpu_to_le32(PWU_MAGIC),
+            .version = PWU_VER,
+            .msg_type = PWUSB_DATA_BENCH_SINK,
+            .flags = 0,
+            .hdr_len = PWU_HDR_LEN,
+            .seq = cpu_to_le16(seq++),
+            .payload_len = cpu_to_le16(max_payload),
+            .xid = cpu_to_le32(0),
+        };
+        memcpy(buf + off, &h, sizeof(h));
+        memset(buf + off + PWU_HDR_LEN, 0x5A, max_payload);
+        off += PWU_HDR_LEN + (size_t)max_payload;
+    }
+
+    pdev->bench_out_seq = seq;
+    return off;
+}
+
+static void pico_bench_out_complete(struct urb* urb) {
+    struct pico_dev* pdev = urb ? urb->context : NULL;
+    int ret;
+
+    if (!pdev || !urb)
+        return;
+
+    if (urb->status == 0) {
+        pdev->bench_out_bytes += (u64)urb->actual_length;
+        pdev->bench_out_urbs_done++;
+    } else if (urb->status != -ENOENT && urb->status != -ESHUTDOWN && urb->status != -ECONNRESET) {
+        pdev->bench_out_errs++;
+    }
+
+    if (!pdev->bench_out_running || pdev->disconnected)
+        return;
+
+    usb_fill_bulk_urb(urb, pdev->udev,
+                      usb_sndbulkpipe(pdev->udev, pdev->ep_out),
+                      urb->transfer_buffer, (int)pdev->bench_out_len,
+                      pico_bench_out_complete, pdev);
+    ret = usb_submit_urb(urb, GFP_ATOMIC);
+    if (ret) {
+        pdev->bench_out_errs++;
+        pdev->bench_out_running = false;
+    }
+}
 
 static bool pico_parse_dhcp4(const u8* frame, size_t len,
                              __be32* sip, __be32* dip,
@@ -247,19 +467,19 @@ static bool pico_parse_dhcp4(const u8* frame, size_t len,
         while (left > 0) {
             u8 code = opt[0];
             u8 olen;
-            if (code == 0) { // pad
+            if (code == 0) {  // pad
                 opt += 1;
                 left -= 1;
                 continue;
             }
-            if (code == 255) // end
+            if (code == 255)  // end
                 break;
             if (left < 2)
                 break;
             olen = opt[1];
             if (left < (size_t)(2 + olen))
                 break;
-            if (code == 53 && olen >= 1) { // DHCP message type
+            if (code == 53 && olen >= 1) {  // DHCP message type
                 *dhcp_msg_type = opt[2];
                 break;
             }
@@ -352,6 +572,80 @@ static void pico_handle_conn_state(struct pico_dev* pdev, const u8* payload, siz
 static void pico_handle_status(struct pico_dev* pdev, const u8* payload, size_t plen);
 static void pico_handle_data_rx(struct pico_dev* pdev, const u8* payload, size_t plen);
 static void pico_ctrl_work_fn(struct work_struct* work);
+static void pico_perf_work_fn(struct work_struct* work);
+static void pico_tx_work_fn(struct work_struct* work);
+
+struct pico_tx_ctx {
+    struct pico_dev* pdev;
+    u8 slot;
+    bool is_dhcp;
+    u16 seq;
+    u32 total;
+};
+
+static int pico_tx_reserve_slot(struct pico_dev* pdev, u8* slot_out) {
+    unsigned long flags;
+    int i;
+
+    if (!pdev || !slot_out)
+        return -EINVAL;
+
+    spin_lock_irqsave(&pdev->tx_lock, flags);
+    for (i = 0; i < PICO_USB_TX_URB_COUNT; i++) {
+        if (!(pdev->tx_busy_map & (1UL << i))) {
+            pdev->tx_busy_map |= (1UL << i);
+            *slot_out = (u8)i;
+            if (pdev->tx_urbs[i] && pdev->tx_urbs[i]->context) {
+                struct pico_tx_ctx* ctx = pdev->tx_urbs[i]->context;
+                ctx->is_dhcp = false;
+                ctx->seq = 0;
+                ctx->total = 0;
+            }
+            spin_unlock_irqrestore(&pdev->tx_lock, flags);
+            return 0;
+        }
+    }
+    spin_unlock_irqrestore(&pdev->tx_lock, flags);
+    return -EAGAIN;
+}
+
+static void pico_tx_release_slot(struct pico_dev* pdev, u8 slot) {
+    unsigned long flags;
+    if (!pdev || slot >= PICO_USB_TX_URB_COUNT)
+        return;
+    spin_lock_irqsave(&pdev->tx_lock, flags);
+    pdev->tx_busy_map &= ~(1UL << slot);
+    spin_unlock_irqrestore(&pdev->tx_lock, flags);
+}
+
+static void pico_free_rx_resources(struct pico_dev* pdev) {
+    int i;
+    if (!pdev) return;
+    for (i = 0; i < PICO_USB_RX_URB_COUNT; i++) {
+        if (pdev->rx_urbs[i]) {
+            usb_free_urb(pdev->rx_urbs[i]);
+            pdev->rx_urbs[i] = NULL;
+        }
+        kfree(pdev->rx_bufs[i]);
+        pdev->rx_bufs[i] = NULL;
+    }
+}
+
+static void pico_free_tx_resources(struct pico_dev* pdev) {
+    int i;
+    if (!pdev) return;
+    for (i = 0; i < PICO_USB_TX_URB_COUNT; i++) {
+        if (pdev->tx_urbs[i]) {
+            kfree(pdev->tx_urbs[i]->context);
+            pdev->tx_urbs[i]->context = NULL;
+            usb_free_urb(pdev->tx_urbs[i]);
+            pdev->tx_urbs[i] = NULL;
+        }
+        kfree(pdev->tx_bufs[i]);
+        pdev->tx_bufs[i] = NULL;
+    }
+    pdev->tx_busy_map = 0;
+}
 
 enum {
     PICO_CTRL_NONE = 0,
@@ -363,14 +657,44 @@ struct pico_netdev_priv {
     struct pico_dev* pdev;
 };
 
+static void pico_stream_resync(struct pico_dev* pdev) {
+    size_t i;
+
+    // Find the next possible 'PHTM' header in the accumulated stream.
+    for (i = 1; i + 4 <= pdev->fr_len; i++) {
+        u32 magic;
+        memcpy(&magic, pdev->fr_buf + i, sizeof(magic));
+        if (le32_to_cpu(magic) == PWU_MAGIC) {
+            if (i > 0) {
+                memmove(pdev->fr_buf, pdev->fr_buf + i, pdev->fr_len - i);
+                pdev->fr_len -= i;
+            }
+            return;
+        }
+    }
+
+    // No magic found: keep last 3 bytes in case 'PHTM' spans URB boundary.
+    if (pdev->fr_len > 3) {
+        memmove(pdev->fr_buf, pdev->fr_buf + (pdev->fr_len - 3), 3);
+        pdev->fr_len = 3;
+    }
+}
+
 static void pico_process_stream(struct pico_dev* pdev, const u8* data, size_t n) {
     // append to framer buffer (simple linear buffer for now)
     if (n == 0) return;
 
     if (pdev->fr_len + n > pdev->fr_cap) {
-        // drop on overflow (v0.1)
-        pdev->fr_len = 0;
-        return;
+        // We've fallen behind (or got a burst). Drop old backlog and keep a tail
+        // so we can resync on the next URB without O(n^2) shifting.
+        pdev->perf_stream_bad++;
+        pico_stream_resync(pdev);
+        if (pdev->fr_len + n > pdev->fr_cap) {
+            // Still too large (should be rare). Drop everything.
+            pdev->perf_stream_bad++;
+            pdev->fr_len = 0;
+            return;
+        }
     }
 
     memcpy(pdev->fr_buf + pdev->fr_len, data, n);
@@ -388,8 +712,8 @@ static void pico_process_stream(struct pico_dev* pdev, const u8* data, size_t n)
 
         // resync by shifting one byte until magic/version/hdrlen match
         if (magic != PWU_MAGIC || h.version != PWU_VER || h.hdr_len != PWU_HDR_LEN) {
-            memmove(pdev->fr_buf, pdev->fr_buf + 1, pdev->fr_len - 1);
-            pdev->fr_len -= 1;
+            pdev->perf_stream_bad++;
+            pico_stream_resync(pdev);
             continue;
         }
 
@@ -398,8 +722,8 @@ static void pico_process_stream(struct pico_dev* pdev, const u8* data, size_t n)
 
         if (total > pdev->fr_cap) {
             // invalid length -> resync
-            memmove(pdev->fr_buf, pdev->fr_buf + 1, pdev->fr_len - 1);
-            pdev->fr_len -= 1;
+            pdev->perf_stream_bad++;
+            pico_stream_resync(pdev);
             continue;
         }
 
@@ -409,6 +733,7 @@ static void pico_process_stream(struct pico_dev* pdev, const u8* data, size_t n)
         }
 
         // We have one complete message
+        pdev->perf_stream_frames++;
         if (h.msg_type == PWUSB_HELLO_RSP) {
             struct phtm_hello_rsp rsp;
             dev_info(&pdev->intf->dev, DRV_NAME ": <- HELLO_RSP seq=%u plen=%u\n",
@@ -416,6 +741,7 @@ static void pico_process_stream(struct pico_dev* pdev, const u8* data, size_t n)
             pdev->got_hello = true;
             if (plen >= sizeof(rsp)) {
                 memcpy(&rsp, pdev->fr_buf + PWU_HDR_LEN, sizeof(rsp));
+                pdev->dev_max_total = le16_to_cpu(rsp.dev_max_payload);
                 if (pdev->netdev)
                     eth_hw_addr_set(pdev->netdev, rsp.mac);
                 dev_info(&pdev->intf->dev, DRV_NAME ": MAC %pM\n", rsp.mac);
@@ -442,6 +768,11 @@ static void pico_process_stream(struct pico_dev* pdev, const u8* data, size_t n)
             pico_handle_status(pdev, pdev->fr_buf + PWU_HDR_LEN, plen);
         } else if (h.msg_type == PWUSB_DATA_RX_ETH) {
             pico_handle_data_rx(pdev, pdev->fr_buf + PWU_HDR_LEN, plen);
+        } else if (h.msg_type == PWUSB_DATA_BENCH_SRC) {
+            if (pdev->bench_in_running) {
+                pdev->bench_in_bytes += (u64)plen;
+                pdev->bench_in_msgs++;
+            }
         } else if (h.msg_type == PWUSB_EVT_ERROR) {
             u32 st = 0;
             if (plen >= sizeof(st))
@@ -468,48 +799,70 @@ static void pico_rx_complete(struct urb* urb) {
 
     if (status == 0) {
         dev_dbg(&pdev->intf->dev, DRV_NAME ": RX urb complete actual_length=%d\n", urb->actual_length);
+        pdev->perf_usb_rx_urbs++;
         if (urb->actual_length > 0)
-            pico_process_stream(pdev, pdev->rx_buf, urb->actual_length);
+            pdev->perf_usb_rx_bytes += (u64)urb->actual_length;
+        if (urb->actual_length > 0)
+            pico_process_stream(pdev, urb->transfer_buffer, urb->actual_length);
     } else if (status == -EOVERFLOW) {
         dev_dbg(&pdev->intf->dev, DRV_NAME ": RX urb overflow (buffer too small)\n");
     } else {
-        if (!pdev->disconnected)
+        /*
+         * On disconnect/unlink, usbcore completes RX URBs with -ECONNRESET/-ENOENT.
+         * Don't warn and don't resubmit in those cases; otherwise we can race
+         * disconnect() teardown and create noisy/log-spam loops.
+         */
+        if (!pdev->disconnected &&
+            status != -ECONNRESET &&
+            status != -ENOENT &&
+            status != -ESHUTDOWN &&
+            status != -ENODEV)
             dev_warn(&pdev->intf->dev, DRV_NAME ": RX urb status=%d\n", status);
     }
 
     // Resubmit unless device is gone
-    if (!pdev->disconnected && status != -ENODEV && status != -ESHUTDOWN)
-        pico_kick_rx(pdev);
+    if (!pdev->disconnected && (status == 0 || status == -EOVERFLOW)) {
+        int ret = usb_submit_urb(urb, GFP_ATOMIC);
+        if (ret)
+            dev_warn(&pdev->intf->dev, DRV_NAME ": usb_submit_urb RX failed: %d\n", ret);
+    }
 }
 
 static void pico_kick_rx(struct pico_dev* pdev) {
+    int i;
     int ret;
 
-    usb_fill_bulk_urb(pdev->rx_urb,
-                      pdev->udev,
-                      usb_rcvbulkpipe(pdev->udev, pdev->ep_in),
-                      pdev->rx_buf,
-                      pdev->rx_buf_size,
-                      pico_rx_complete,
-                      pdev);
+    for (i = 0; i < PICO_USB_RX_URB_COUNT; i++) {
+        if (!pdev->rx_urbs[i] || !pdev->rx_bufs[i])
+            continue;
 
-    ret = usb_submit_urb(pdev->rx_urb, GFP_ATOMIC);
-    if (ret)
-        dev_warn(&pdev->intf->dev, DRV_NAME ": usb_submit_urb RX failed: %d\n", ret);
-    else
-        dev_dbg(&pdev->intf->dev, DRV_NAME ": RX urb submitted len=%zu\n", pdev->rx_buf_size);
+        usb_fill_bulk_urb(pdev->rx_urbs[i],
+                          pdev->udev,
+                          usb_rcvbulkpipe(pdev->udev, pdev->ep_in),
+                          pdev->rx_bufs[i],
+                          pdev->rx_buf_size,
+                          pico_rx_complete,
+                          pdev);
+
+        ret = usb_submit_urb(pdev->rx_urbs[i], GFP_ATOMIC);
+        if (ret)
+            dev_warn(&pdev->intf->dev, DRV_NAME ": usb_submit_urb RX[%d] failed: %d\n", i, ret);
+        else
+            dev_dbg(&pdev->intf->dev, DRV_NAME ": RX urb[%d] submitted len=%zu\n", i, pdev->rx_buf_size);
+    }
 }
 
 static void pico_tx_complete(struct urb* urb) {
-    struct pico_dev* pdev = urb->context;
+    struct pico_tx_ctx* ctx = urb ? urb->context : NULL;
+    struct pico_dev* pdev = ctx ? ctx->pdev : NULL;
     int status = urb->status;
 
     if (!pdev) return;
 
-    if (pico_debug && pdev->last_tx_is_dhcp && pdev->dhcp_tx_complete_dbg_count < 10) {
+    if (pico_debug && ctx->is_dhcp && pdev->dhcp_tx_complete_dbg_count < 10) {
         dev_info(&pdev->intf->dev,
                  DRV_NAME ": TX DHCP complete status=%d actual=%d seq=%u total=%u\n",
-                 status, urb->actual_length, pdev->last_tx_seq, pdev->last_tx_total);
+                 status, urb->actual_length, ctx->seq, ctx->total);
         pdev->dhcp_tx_complete_dbg_count++;
     }
 
@@ -518,39 +871,56 @@ static void pico_tx_complete(struct urb* urb) {
     else
         dev_dbg(&pdev->intf->dev, DRV_NAME ": TX complete len=%d\n", urb->actual_length);
 
-    /* Mark TX as free */
-    atomic_set(&pdev->tx_busy, 0);
-    pdev->last_tx_is_dhcp = false;
-    if (pdev->netdev && pdev->conn_connected && netif_carrier_ok(pdev->netdev))
-        netif_wake_queue(pdev->netdev);
+    /* Mark slot as free */
+    pico_tx_release_slot(pdev, ctx->slot);
+    ctx->is_dhcp = false;
+    if (!pdev->disconnected) {
+        // Drain any queued TX skbs now that a slot is free.
+        queue_work(system_highpri_wq, &pdev->tx_work);
+        if (pdev->netdev && pdev->conn_connected && netif_carrier_ok(pdev->netdev))
+            netif_wake_queue(pdev->netdev);
+    }
 }
 
 static int pico_tx_submit_gfp(struct pico_dev* pdev, const u8* data, size_t n, gfp_t gfp) {
     int ret;
+    u8 slot;
+    struct pico_tx_ctx* ctx;
 
     if (!pdev || pdev->disconnected)
         return -ENODEV;
 
-    if (n > pdev->tx_buf_size) return -EINVAL;
+    if (n > PICO_USB_TX_BUF_SIZE) return -EINVAL;
 
-    /* simple single-URB TX queue: fail if busy */
-    if (atomic_xchg(&pdev->tx_busy, 1)) return -EAGAIN;
+    ret = pico_tx_reserve_slot(pdev, &slot);
+    if (ret) {
+        pdev->perf_usb_tx_eagain++;
+        return -EAGAIN;
+    }
 
-    memcpy(pdev->tx_buf, data, n);
+    memcpy(pdev->tx_bufs[slot], data, n);
+    ctx = (struct pico_tx_ctx*)pdev->tx_urbs[slot]->context;
+    if (!ctx) {
+        // Should not happen; set in probe().
+        pico_tx_release_slot(pdev, slot);
+        return -EINVAL;
+    }
 
-    usb_fill_bulk_urb(pdev->tx_urb,
+    usb_fill_bulk_urb(pdev->tx_urbs[slot],
                       pdev->udev,
                       usb_sndbulkpipe(pdev->udev, pdev->ep_out),
-                      pdev->tx_buf,
+                      pdev->tx_bufs[slot],
                       n,
                       pico_tx_complete,
-                      pdev);
+                      ctx);
 
-    ret = usb_submit_urb(pdev->tx_urb, gfp);
+    ret = usb_submit_urb(pdev->tx_urbs[slot], gfp);
     if (ret) {
-        atomic_set(&pdev->tx_busy, 0);
+        pico_tx_release_slot(pdev, slot);
         dev_warn(&pdev->intf->dev, DRV_NAME ": usb_submit_urb TX failed: %d\n", ret);
     } else {
+        pdev->perf_usb_tx_submits++;
+        pdev->perf_usb_tx_bytes += (u64)n;
         dev_dbg(&pdev->intf->dev, DRV_NAME ": -> TX submitted len=%zu\n", n);
     }
 
@@ -559,6 +929,177 @@ static int pico_tx_submit_gfp(struct pico_dev* pdev, const u8* data, size_t n, g
 
 static int pico_tx_submit(struct pico_dev* pdev, const u8* data, size_t n) {
     return pico_tx_submit_gfp(pdev, data, n, GFP_KERNEL);
+}
+
+static void pico_tx_work_fn(struct work_struct* work) {
+    struct pico_dev* pdev = container_of(work, struct pico_dev, tx_work);
+    struct net_device* ndev = pdev ? pdev->netdev : NULL;
+    int loops = 0;
+
+    if (!pdev || pdev->disconnected || !pdev->udev)
+        return;
+
+    // Drain queued skbs into as many in-flight URBs as we have slots for.
+    // Limit outer loop to avoid monopolizing CPU.
+    while (loops++ < PICO_USB_TX_URB_COUNT) {
+        struct sk_buff* skb;
+        u8 slot;
+        int ret;
+        u8* buf;
+        size_t off = 0;
+        u32 pkts = 0;
+        u32 bytes = 0;
+
+        if (skb_queue_empty(&pdev->tx_skb_q))
+            break;
+
+        ret = pico_tx_reserve_slot(pdev, &slot);
+        if (ret)
+            break;  // no slot, will be re-kicked on completion
+
+        buf = pdev->tx_bufs[slot];
+
+        while ((skb = skb_dequeue(&pdev->tx_skb_q)) != NULL) {
+            struct pwu_hdr h;
+            size_t total = PWU_HDR_LEN + skb->len;
+            bool is_dhcp = false;
+
+            if (off + total > PICO_USB_TX_BUF_SIZE) {
+                // Doesn't fit; put it back for the next URB.
+                skb_queue_head(&pdev->tx_skb_q, skb);
+                break;
+            }
+
+            memset(&h, 0, sizeof(h));
+            h.magic = cpu_to_le32(PWU_MAGIC);
+            h.version = PWU_VER;
+            h.msg_type = PWUSB_DATA_TX_ETH;
+            h.flags = 0;
+            h.hdr_len = PWU_HDR_LEN;
+            h.seq = cpu_to_le16(pdev->last_seq++);
+            h.payload_len = cpu_to_le16(skb->len);
+            h.xid = cpu_to_le32(0);
+
+            memcpy(buf + off, &h, sizeof(h));
+            skb_copy_bits(skb, 0, buf + off + PWU_HDR_LEN, skb->len);
+
+            // Optional: DHCP broadcast flag tweak can be applied to the copied frame.
+            if (pico_dhcp_force_broadcast) {
+                u8 hdr[96];
+                size_t hdr_len = min_t(size_t, skb->len, sizeof(hdr));
+                __be32 sip = 0, dip = 0;
+                u16 sport = 0, dport = 0;
+                u8 dhcp_type = 0;
+                u32 dhcp_xid = 0;
+                __be32 yiaddr = 0;
+                u16 flags = 0;
+
+                if (hdr_len >= ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr) &&
+                    !skb_copy_bits(skb, 0, hdr, hdr_len) &&
+                    pico_parse_dhcp4(hdr, hdr_len, &sip, &dip, &sport, &dport,
+                                     &dhcp_type, &dhcp_xid, &yiaddr, &flags)) {
+                    is_dhcp = true;
+                }
+                if (is_dhcp)
+                    pico_dhcp_set_broadcast_flag(buf + off + PWU_HDR_LEN, skb->len);
+            }
+
+            off += total;
+            pkts++;
+            bytes += (u32)skb->len;
+
+            dev_kfree_skb_any(skb);
+
+            // Bound per-URB work: stop if we can't fit even the smallest frame.
+            if (PICO_USB_TX_BUF_SIZE - off < PWU_HDR_LEN + 64)
+                break;
+            if (pkts >= PICO_USB_TX_MAX_PKTS_PER_URB)
+                break;
+        }
+
+        if (!pkts) {
+            pico_tx_release_slot(pdev, slot);
+            break;
+        }
+
+        usb_fill_bulk_urb(pdev->tx_urbs[slot],
+                          pdev->udev,
+                          usb_sndbulkpipe(pdev->udev, pdev->ep_out),
+                          buf,
+                          off,
+                          pico_tx_complete,
+                          pdev->tx_urbs[slot]->context);
+
+        ret = usb_submit_urb(pdev->tx_urbs[slot], GFP_ATOMIC);
+        if (ret) {
+            pico_tx_release_slot(pdev, slot);
+            pdev->perf_usb_tx_eagain++;
+            if (ndev)
+                ndev->stats.tx_dropped += pkts;
+            break;
+        }
+
+        pdev->perf_usb_tx_submits++;
+        pdev->perf_usb_tx_bytes += (u64)off;
+        if (ndev) {
+            ndev->stats.tx_packets += pkts;
+            ndev->stats.tx_bytes += bytes;
+        }
+    }
+
+    if (ndev && netif_queue_stopped(ndev) &&
+        skb_queue_len(&pdev->tx_skb_q) < (pdev->tx_skb_q_limit / 2) &&
+        pdev->conn_connected && netif_carrier_ok(ndev)) {
+        netif_wake_queue(ndev);
+    }
+}
+
+static int pico_send_bench_start(struct pico_dev* pdev, u8 dir, u16 payload_len) {
+    u8 msg[PWU_HDR_LEN + sizeof(struct phtm_bench_start_req)];
+    struct pwu_hdr h;
+    struct phtm_bench_start_req req;
+
+    if (!pdev)
+        return -ENODEV;
+
+    req.dir = dir;
+    req.payload_len = cpu_to_le16(pico_bench_cap_payload(pdev, payload_len));
+
+    memset(&h, 0, sizeof(h));
+    h.magic = cpu_to_le32(PWU_MAGIC);
+    h.version = PWU_VER;
+    h.msg_type = PWUSB_CMD_BENCH_START;
+    h.flags = 0;
+    h.hdr_len = PWU_HDR_LEN;
+    h.seq = cpu_to_le16(pdev->last_seq++);
+    h.payload_len = cpu_to_le16(sizeof(req));
+    h.xid = cpu_to_le32(0);
+
+    memcpy(msg, &h, sizeof(h));
+    memcpy(msg + PWU_HDR_LEN, &req, sizeof(req));
+
+    return pico_tx_submit(pdev, msg, sizeof(msg));
+}
+
+static int pico_send_bench_stop(struct pico_dev* pdev) {
+    u8 msg[PWU_HDR_LEN];
+    struct pwu_hdr h;
+
+    if (!pdev)
+        return -ENODEV;
+
+    memset(&h, 0, sizeof(h));
+    h.magic = cpu_to_le32(PWU_MAGIC);
+    h.version = PWU_VER;
+    h.msg_type = PWUSB_CMD_BENCH_STOP;
+    h.flags = 0;
+    h.hdr_len = PWU_HDR_LEN;
+    h.seq = cpu_to_le16(pdev->last_seq++);
+    h.payload_len = cpu_to_le16(0);
+    h.xid = cpu_to_le32(0);
+
+    memcpy(msg, &h, sizeof(h));
+    return pico_tx_submit(pdev, msg, sizeof(msg));
 }
 
 /* Send a HELLO message (non-blocking via TX URB) */
@@ -727,6 +1268,7 @@ int pico_ctrl_connect(struct pico_dev* pdev,
 int pico_ctrl_disconnect(struct pico_dev* pdev) {
     if (!pdev)
         return -ENODEV;
+    pico_scan_clear(pdev);
     pdev->ctrl_cmd = PICO_CTRL_DISCONNECT;
     schedule_delayed_work(&pdev->ctrl_work, 0);
     return 0;
@@ -776,6 +1318,36 @@ static void pico_ctrl_work_fn(struct work_struct* work) {
         default:
             return;
     }
+}
+
+static void pico_perf_work_fn(struct work_struct* work) {
+    struct pico_dev* pdev = container_of(work, struct pico_dev, perf_work.work);
+    u64 d_usb_rx_bytes, d_data_rx_bytes, d_netif_drop, d_usb_tx_bytes, d_usb_tx_eagain;
+
+    if (!pdev || pdev->disconnected)
+        return;
+
+    if (pico_perf) {
+        d_usb_rx_bytes = pdev->perf_usb_rx_bytes - pdev->perf_last_usb_rx_bytes;
+        d_data_rx_bytes = pdev->perf_data_rx_bytes - pdev->perf_last_data_rx_bytes;
+        d_netif_drop = pdev->perf_data_rx_netif_drop - pdev->perf_last_data_rx_netif_drop;
+        d_usb_tx_bytes = pdev->perf_usb_tx_bytes - pdev->perf_last_usb_tx_bytes;
+        d_usb_tx_eagain = pdev->perf_usb_tx_eagain - pdev->perf_last_usb_tx_eagain;
+
+        pdev->perf_last_usb_rx_bytes = pdev->perf_usb_rx_bytes;
+        pdev->perf_last_data_rx_bytes = pdev->perf_data_rx_bytes;
+        pdev->perf_last_data_rx_netif_drop = pdev->perf_data_rx_netif_drop;
+        pdev->perf_last_usb_tx_bytes = pdev->perf_usb_tx_bytes;
+        pdev->perf_last_usb_tx_eagain = pdev->perf_usb_tx_eagain;
+
+        dev_info(&pdev->intf->dev,
+                 DRV_NAME ": PERF 1s: usb_rx=%llu B data_rx=%llu B netif_drop=%llu | usb_tx=%llu B tx_eagain=%llu | stream_frames=%llu stream_bad=%llu\n",
+                 d_usb_rx_bytes, d_data_rx_bytes, d_netif_drop,
+                 d_usb_tx_bytes, d_usb_tx_eagain,
+                 pdev->perf_stream_frames, pdev->perf_stream_bad);
+    }
+
+    schedule_delayed_work(&pdev->perf_work, HZ);
 }
 
 /* Send GET_STATUS command */
@@ -1009,10 +1581,12 @@ static void pico_handle_data_rx(struct pico_dev* pdev, const u8* payload, size_t
     __be32 yiaddr = 0;
     u16 flags = 0;
     bool is_dhcp = false;
-    int rx_ret;
 
     if (!pdev || !pdev->netdev || plen == 0)
         return;
+
+    pdev->perf_data_rx_pkts++;
+    pdev->perf_data_rx_bytes += (u64)plen;
 
     is_dhcp = pico_parse_dhcp4(payload, plen, &sip, &dip, &sport, &dport,
                                &dhcp_type, &dhcp_xid, &yiaddr, &flags);
@@ -1041,10 +1615,24 @@ static void pico_handle_data_rx(struct pico_dev* pdev, const u8* payload, size_t
     memcpy(skb_put(skb, plen), payload, plen);
     skb->ip_summed = CHECKSUM_NONE; /* no offload; data is already on the wire */
     skb->protocol = eth_type_trans(skb, pdev->netdev);
-    rx_ret = netif_rx(skb);
-    if (is_dhcp && rx_ret != NET_RX_SUCCESS) {
-        dev_warn(&pdev->intf->dev, DRV_NAME ": RX DHCP netif_rx ret=%d\n", rx_ret);
+    if (unlikely(pdev->disconnected || !netif_running(pdev->netdev))) {
+        pdev->netdev->stats.rx_dropped++;
+        dev_kfree_skb_any(skb);
+        return;
     }
+
+    if (unlikely(skb_queue_len(&pdev->rx_skb_q) >= pdev->rx_skb_q_limit)) {
+        pdev->netdev->stats.rx_dropped++;
+        pdev->perf_data_rx_netif_drop++;
+        dev_kfree_skb_any(skb);
+        if (is_dhcp) {
+            dev_warn(&pdev->intf->dev, DRV_NAME ": RX DHCP drop (napi queue full)\n");
+        }
+        return;
+    }
+
+    skb_queue_tail(&pdev->rx_skb_q, skb);
+    napi_schedule(&pdev->napi);
 
     pdev->netdev->stats.rx_packets++;
     pdev->netdev->stats.rx_bytes += plen;
@@ -1053,19 +1641,6 @@ static void pico_handle_data_rx(struct pico_dev* pdev, const u8* payload, size_t
 static netdev_tx_t pico_ndo_start_xmit(struct sk_buff* skb, struct net_device* ndev) {
     struct pico_netdev_priv* priv = netdev_priv(ndev);
     struct pico_dev* pdev = priv ? priv->pdev : NULL;
-    u8* msg;
-    size_t total;
-    struct pwu_hdr h;
-    int ret;
-    u8 hdr[96];
-    size_t hdr_len;
-    __be32 sip = 0, dip = 0;
-    u16 sport = 0, dport = 0;
-    u8 dhcp_type = 0;
-    u32 dhcp_xid = 0;
-    __be32 yiaddr = 0;
-    u16 flags = 0;
-    bool is_dhcp = false;
 
     if (!pdev || !pdev->udev) {
         ndev->stats.tx_dropped++;
@@ -1088,15 +1663,6 @@ static netdev_tx_t pico_ndo_start_xmit(struct sk_buff* skb, struct net_device* n
         }
     }
 
-    hdr_len = min_t(size_t, skb->len, sizeof(hdr));
-    if (hdr_len >= ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr) &&
-        !skb_copy_bits(skb, 0, hdr, hdr_len) &&
-        pico_parse_dhcp4(hdr, hdr_len, &sip, &dip, &sport, &dport,
-                         &dhcp_type, &dhcp_xid, &yiaddr, &flags)) {
-        is_dhcp = true;
-        // Note: hdr_len may be too small to parse options; we re-parse after building the full frame.
-    }
-
     if (pico_debug && pdev->tx_dbg_count < 10) {
         __be16 proto = 0;
         struct ethhdr eh;
@@ -1107,84 +1673,32 @@ static netdev_tx_t pico_ndo_start_xmit(struct sk_buff* skb, struct net_device* n
         pdev->tx_dbg_count++;
     }
 
-    total = PWU_HDR_LEN + skb->len;
-    if (total > pdev->tx_buf_size) {
+    // Each PWUSB frame must fit within device max total.
+    if ((PWU_HDR_LEN + skb->len) > (pdev->dev_max_total ? pdev->dev_max_total : 2048)) {
         ndev->stats.tx_dropped++;
         dev_kfree_skb_any(skb);
         return NETDEV_TX_OK;
     }
 
-    msg = kmalloc(total, GFP_ATOMIC);
-    if (!msg) {
-        ndev->stats.tx_dropped++;
-        dev_kfree_skb_any(skb);
-        return NETDEV_TX_OK;
-    }
-
-    memset(&h, 0, sizeof(h));
-    h.magic = cpu_to_le32(PWU_MAGIC);
-    h.version = PWU_VER;
-    h.msg_type = PWUSB_DATA_TX_ETH;
-    h.flags = 0;
-    h.hdr_len = PWU_HDR_LEN;
-    h.seq = cpu_to_le16(pdev->last_seq++);
-    h.payload_len = cpu_to_le16(skb->len);
-    h.xid = cpu_to_le32(0);
-
-    if (is_dhcp) {
-        pdev->last_tx_is_dhcp = true;
-        pdev->last_tx_seq = le16_to_cpu(h.seq);
-        pdev->last_tx_total = (u32)total;
-    }
-
-    memcpy(msg, &h, sizeof(h));
-    skb_copy_bits(skb, 0, msg + PWU_HDR_LEN, skb->len);
-
-    if (pico_debug && is_dhcp && pdev->dhcp_tx_dbg_count < 10) {
-        // Parse from the fully assembled Ethernet frame to get DHCP message type/xid reliably.
-        (void)pico_parse_dhcp4(msg + PWU_HDR_LEN, skb->len, &sip, &dip, &sport, &dport,
-                               &dhcp_type, &dhcp_xid, &yiaddr, &flags);
-        dev_info(&pdev->intf->dev,
-                 DRV_NAME ": TX DHCP4 t=%u xid=0x%08x yiaddr=%pI4 flags=0x%04x %pI4:%u -> %pI4:%u len=%u\n",
-                 dhcp_type, dhcp_xid, &yiaddr, flags, &sip, sport, &dip, dport, skb->len);
-        pdev->dhcp_tx_dbg_count++;
-    }
-
-    if (is_dhcp && pico_dhcp_force_broadcast) {
-        // Make server responses more likely to be broadcast so dhclient's filters
-        // won't miss them on a fresh interface with no IP configured yet.
-        pico_dhcp_set_broadcast_flag(msg + PWU_HDR_LEN, skb->len);
-    }
-
-    ret = pico_tx_submit_gfp(pdev, msg, total, GFP_ATOMIC);
-    kfree(msg);
-
-    if (pico_debug && is_dhcp && pdev->dhcp_tx_dbg_count <= 10) {
-        dev_info(&pdev->intf->dev, DRV_NAME ": TX DHCP submit ret=%d tx_busy=%d\n",
-                 ret, atomic_read(&pdev->tx_busy));
-    }
-
-    if (ret == -EAGAIN)
-    {
+    if (skb_queue_len(&pdev->tx_skb_q) >= pdev->tx_skb_q_limit) {
         pdev->tx_eagain_count++;
+        pdev->perf_usb_tx_eagain++;
         netif_stop_queue(ndev);
         return NETDEV_TX_BUSY;
     }
-    if (ret) {
-        ndev->stats.tx_dropped++;
-        dev_kfree_skb_any(skb);
-        return NETDEV_TX_OK;
-    }
 
-    ndev->stats.tx_packets++;
-    ndev->stats.tx_bytes += skb->len;
-    dev_kfree_skb_any(skb);
+    // Own the skb and submit from worker so we can aggregate multiple frames per URB.
+    skb_queue_tail(&pdev->tx_skb_q, skb);
+    queue_work(system_highpri_wq, &pdev->tx_work);
     return NETDEV_TX_OK;
 }
 
 static int pico_ndo_open(struct net_device* ndev) {
     struct pico_netdev_priv* priv = netdev_priv(ndev);
     struct pico_dev* pdev = priv ? priv->pdev : NULL;
+
+    if (pdev)
+        napi_enable(&pdev->napi);
 
     if (pdev && pdev->conn_connected) {
         netif_carrier_on(ndev);
@@ -1197,8 +1711,17 @@ static int pico_ndo_open(struct net_device* ndev) {
 }
 
 static int pico_ndo_stop(struct net_device* ndev) {
+    struct pico_netdev_priv* priv = netdev_priv(ndev);
+    struct pico_dev* pdev = priv ? priv->pdev : NULL;
+
     netif_stop_queue(ndev);
     netif_carrier_off(ndev);
+
+    if (pdev) {
+        napi_disable(&pdev->napi);
+        skb_queue_purge(&pdev->rx_skb_q);
+    }
+
     return 0;
 }
 
@@ -1206,6 +1729,299 @@ static const struct net_device_ops pico_netdev_ops = {
     .ndo_open = pico_ndo_open,
     .ndo_stop = pico_ndo_stop,
     .ndo_start_xmit = pico_ndo_start_xmit,
+};
+
+static void pico_bench_out_stop_locked(struct pico_dev* pdev) {
+    int i;
+
+    if (!pdev)
+        return;
+
+    pdev->bench_out_running = false;
+
+    for (i = 0; i < PICO_BENCH_OUT_URB_COUNT; i++) {
+        if (pdev->bench_out_urbs[i])
+            usb_kill_urb(pdev->bench_out_urbs[i]);
+    }
+
+    for (i = 0; i < PICO_BENCH_OUT_URB_COUNT; i++) {
+        if (pdev->bench_out_urbs[i]) {
+            usb_free_urb(pdev->bench_out_urbs[i]);
+            pdev->bench_out_urbs[i] = NULL;
+        }
+        kfree(pdev->bench_out_bufs[i]);
+        pdev->bench_out_bufs[i] = NULL;
+    }
+
+    pdev->bench_out_len = 0;
+    pdev->bench_out_payload_len = 0;
+    pdev->bench_out_eff_payload_len = 0;
+}
+
+static int pico_bench_out_start_locked(struct pico_dev* pdev, u16 payload_len) {
+    int i;
+    int ret;
+    u16 eff_plen;
+
+    if (!pdev || pdev->disconnected)
+        return -ENODEV;
+
+    if (pdev->bench_out_running)
+        return -EBUSY;
+
+    eff_plen = pico_bench_cap_payload(pdev, payload_len);
+    if (!eff_plen)
+        return -EINVAL;
+
+    /* Stop any leftover resources, then allocate fresh. */
+    pico_bench_out_stop_locked(pdev);
+
+    pdev->bench_out_payload_len = payload_len;
+    pdev->bench_out_eff_payload_len = eff_plen;
+    pdev->bench_out_bytes = 0;
+    pdev->bench_out_urbs_done = 0;
+    pdev->bench_out_errs = 0;
+    pdev->bench_out_start_j = jiffies;
+
+    /* Build one OUT buffer packed with framed BENCH_SINK messages. */
+    pdev->bench_out_bufs[0] = kmalloc(PICO_BENCH_OUT_URB_SIZE, GFP_KERNEL);
+    if (!pdev->bench_out_bufs[0])
+        return -ENOMEM;
+
+    pdev->bench_out_len = pico_build_bench_out_buf(pdev, pdev->bench_out_bufs[0],
+                                                   PICO_BENCH_OUT_URB_SIZE, eff_plen);
+    if (!pdev->bench_out_len) {
+        kfree(pdev->bench_out_bufs[0]);
+        pdev->bench_out_bufs[0] = NULL;
+        return -EINVAL;
+    }
+
+    /* Clone the same buffer into each URB to avoid sharing a single buffer among in-flight URBs. */
+    for (i = 1; i < PICO_BENCH_OUT_URB_COUNT; i++) {
+        pdev->bench_out_bufs[i] = kmalloc(PICO_BENCH_OUT_URB_SIZE, GFP_KERNEL);
+        if (!pdev->bench_out_bufs[i]) {
+            ret = -ENOMEM;
+            goto err;
+        }
+        memcpy(pdev->bench_out_bufs[i], pdev->bench_out_bufs[0], pdev->bench_out_len);
+    }
+
+    for (i = 0; i < PICO_BENCH_OUT_URB_COUNT; i++) {
+        pdev->bench_out_urbs[i] = usb_alloc_urb(0, GFP_KERNEL);
+        if (!pdev->bench_out_urbs[i]) {
+            ret = -ENOMEM;
+            goto err;
+        }
+        usb_fill_bulk_urb(pdev->bench_out_urbs[i], pdev->udev,
+                          usb_sndbulkpipe(pdev->udev, pdev->ep_out),
+                          pdev->bench_out_bufs[i], (int)pdev->bench_out_len,
+                          pico_bench_out_complete, pdev);
+    }
+
+    pdev->bench_out_running = true;
+
+    for (i = 0; i < PICO_BENCH_OUT_URB_COUNT; i++) {
+        ret = usb_submit_urb(pdev->bench_out_urbs[i], GFP_KERNEL);
+        if (ret) {
+            pdev->bench_out_errs++;
+            pdev->bench_out_running = false;
+            goto err;
+        }
+    }
+
+    return 0;
+
+err:
+    pico_bench_out_stop_locked(pdev);
+    return ret;
+}
+
+static void pico_bench_reset_locked(struct pico_dev* pdev) {
+    if (!pdev)
+        return;
+    pdev->bench_in_bytes = 0;
+    pdev->bench_in_msgs = 0;
+    pdev->bench_in_start_j = jiffies;
+    pdev->bench_out_bytes = 0;
+    pdev->bench_out_urbs_done = 0;
+    pdev->bench_out_errs = 0;
+    pdev->bench_out_start_j = jiffies;
+}
+
+static int pico_dbg_bench_stats_show(struct seq_file* s, void* unused) {
+    struct pico_dev* pdev = s->private;
+    unsigned long now = jiffies;
+    u64 in_payload_bytes, in_bus_bytes;
+    u64 out_bus_bytes;
+    unsigned long in_ms = 0, out_ms = 0;
+    u64 in_kbps = 0, out_kbps = 0;
+    u32 in_mbps_i = 0, out_mbps_i = 0;
+    u32 in_mbps_f = 0, out_mbps_f = 0;
+    u16 eff_plen = 0;
+    u32 out_msgs_per_urb = 0;
+
+    mutex_lock(&pdev->bench_lock);
+    in_payload_bytes = pdev->bench_in_bytes;
+    in_bus_bytes = pdev->bench_in_bytes + (u64)PWU_HDR_LEN * pdev->bench_in_msgs;
+    out_bus_bytes = pdev->bench_out_bytes;
+    if (pdev->bench_in_running)
+        in_ms = jiffies_to_msecs(now - pdev->bench_in_start_j);
+    if (pdev->bench_out_running)
+        out_ms = jiffies_to_msecs(now - pdev->bench_out_start_j);
+    eff_plen = pdev->bench_out_eff_payload_len;
+    if (pdev->bench_out_len && eff_plen) {
+        u32 frame_sz = (u32)PWU_HDR_LEN + (u32)eff_plen;
+        out_msgs_per_urb = (u32)(pdev->bench_out_len / frame_sz);
+    }
+    mutex_unlock(&pdev->bench_lock);
+
+    /*
+     * Report kbps/mbps derived directly from bytes + elapsed ms.
+     * kbps = (bytes * 8) / ms  (since bits/ms == kb/s)
+     */
+    if (in_ms) {
+        in_kbps = div_u64(in_bus_bytes * 8ULL, (u64)in_ms);
+        in_mbps_i = (u32)(in_kbps / 1000ULL);
+        in_mbps_f = (u32)(in_kbps % 1000ULL);
+    }
+    if (out_ms) {
+        out_kbps = div_u64(out_bus_bytes * 8ULL, (u64)out_ms);
+        out_mbps_i = (u32)(out_kbps / 1000ULL);
+        out_mbps_f = (u32)(out_kbps % 1000ULL);
+    }
+
+    seq_printf(s, "dev_max_total=%u\n", pdev->dev_max_total);
+
+    seq_printf(s, "in_running=%u in_payload_bytes=%llu in_bus_bytes=%llu in_msgs=%llu in_ms=%lu in_kbps=%llu in_mbps=%u.%03u\n",
+               pdev->bench_in_running ? 1 : 0,
+               (unsigned long long)in_payload_bytes,
+               (unsigned long long)in_bus_bytes,
+               (unsigned long long)pdev->bench_in_msgs,
+               in_ms,
+               (unsigned long long)in_kbps,
+               in_mbps_i, in_mbps_f);
+
+    seq_printf(s, "out_running=%u out_bus_bytes=%llu out_urbs_done=%llu out_errs=%llu out_ms=%lu out_kbps=%llu out_mbps=%u.%03u out_req_plen=%u out_eff_plen=%u out_msgs_per_urb=%u out_urb_len=%zu\n",
+               pdev->bench_out_running ? 1 : 0,
+               (unsigned long long)out_bus_bytes,
+               (unsigned long long)pdev->bench_out_urbs_done,
+               (unsigned long long)pdev->bench_out_errs,
+               out_ms,
+               (unsigned long long)out_kbps,
+               out_mbps_i, out_mbps_f,
+               pdev->bench_out_payload_len,
+               pdev->bench_out_eff_payload_len,
+               out_msgs_per_urb,
+               pdev->bench_out_len);
+
+    seq_printf(s, "usage: echo 'in <plen>'|'out <plen>'|'both <plen>'|'stop'|'reset' > bench_control\n");
+    return 0;
+}
+
+static int pico_dbg_bench_stats_open(struct inode* inode, struct file* file) {
+    return single_open(file, pico_dbg_bench_stats_show, inode->i_private);
+}
+
+static ssize_t pico_dbg_bench_control_write(struct file* file,
+                                            const char __user* buf,
+                                            size_t len,
+                                            loff_t* ppos) {
+    struct pico_dev* pdev = file->private_data;
+    char in[64];
+    char cmd[16] = {0};
+    unsigned int plen = 0;
+    size_t n = min_t(size_t, len, sizeof(in) - 1);
+    int ret = 0;
+
+    if (!pdev || n == 0)
+        return -EINVAL;
+
+    if (copy_from_user(in, buf, n))
+        return -EFAULT;
+    in[n] = '\0';
+
+    while (n > 0 && (in[n - 1] == '\n' || in[n - 1] == '\r')) {
+        in[n - 1] = '\0';
+        n--;
+    }
+
+    if (sscanf(in, "%15s %u", cmd, &plen) < 1)
+        return -EINVAL;
+
+    mutex_lock(&pdev->bench_lock);
+
+    if (!strcmp(cmd, "stop")) {
+        pdev->bench_in_running = false;
+        pico_bench_out_stop_locked(pdev);
+        mutex_unlock(&pdev->bench_lock);
+        /* Best-effort: stop device-side source. */
+        pico_send_bench_stop(pdev);
+        return len;
+    }
+
+    if (!strcmp(cmd, "reset")) {
+        pdev->bench_in_running = false;
+        pico_bench_out_stop_locked(pdev);
+        pico_bench_reset_locked(pdev);
+        mutex_unlock(&pdev->bench_lock);
+        pico_send_bench_stop(pdev);
+        return len;
+    }
+
+    if (!strcmp(cmd, "in") || !strcmp(cmd, "both")) {
+        pdev->bench_in_bytes = 0;
+        pdev->bench_in_msgs = 0;
+        pdev->bench_in_start_j = jiffies;
+        pdev->bench_in_running = true;
+        ret = pico_send_bench_start(pdev, !strcmp(cmd, "both") ? 0x03 : 0x01, (u16)plen);
+        if (ret) {
+            pdev->bench_in_running = false;
+            mutex_unlock(&pdev->bench_lock);
+            return ret;
+        }
+    }
+
+    if (!strcmp(cmd, "out")) {
+        /* Tell device to enable fast-drop sink mode. */
+        ret = pico_send_bench_start(pdev, 0x02, (u16)plen);
+        if (ret) {
+            mutex_unlock(&pdev->bench_lock);
+            return ret;
+        }
+    }
+
+    if (!strcmp(cmd, "out") || !strcmp(cmd, "both")) {
+        ret = pico_bench_out_start_locked(pdev, (u16)plen);
+        if (ret) {
+            if (!strcmp(cmd, "both")) {
+                pdev->bench_in_running = false;
+                pico_send_bench_stop(pdev);
+            }
+            mutex_unlock(&pdev->bench_lock);
+            return ret;
+        }
+    }
+
+    mutex_unlock(&pdev->bench_lock);
+
+    if (strcmp(cmd, "in") && strcmp(cmd, "out") && strcmp(cmd, "both"))
+        return -EINVAL;
+
+    return len;
+}
+
+static const struct file_operations pico_dbg_bench_stats_fops = {
+    .owner = THIS_MODULE,
+    .open = pico_dbg_bench_stats_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static const struct file_operations pico_dbg_bench_control_fops = {
+    .owner = THIS_MODULE,
+    .write = pico_dbg_bench_control_write,
+    .open = simple_open,
 };
 
 static int pico_dbg_scan_results_show(struct seq_file* s, void* unused) {
@@ -1441,6 +2257,12 @@ static int pico_probe(struct usb_interface* interface,
 
     pdev->udev = usb_get_dev(udev);
     pdev->intf = interface;
+    /*
+     * disconnect() can race with probe() after usb_set_intfdata() is set.
+     * Initialize the bench mutex early so disconnect never sees an
+     * uninitialized lock.
+     */
+    mutex_init(&pdev->bench_lock);
 
     // find bulk endpoints
     for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
@@ -1470,34 +2292,69 @@ static int pico_probe(struct usb_interface* interface,
         return -ENODEV;
     }
 
-    // Allocate RX URB + buffers
-    pdev->rx_buf_size = 2048;
-    pdev->rx_buf = kmalloc(pdev->rx_buf_size, GFP_KERNEL);
-    pdev->rx_urb = usb_alloc_urb(0, GFP_KERNEL);
+    // Allocate RX URBs + buffers
+    pdev->rx_buf_size = PICO_USB_RX_URB_SIZE;
+    for (i = 0; i < PICO_USB_RX_URB_COUNT; i++) {
+        pdev->rx_bufs[i] = kmalloc(pdev->rx_buf_size, GFP_KERNEL);
+        pdev->rx_urbs[i] = usb_alloc_urb(0, GFP_KERNEL);
+    }
 
-    pdev->fr_cap = 2048;
+    pdev->fr_cap = PICO_STREAM_FR_CAP;
     pdev->fr_buf = kmalloc(pdev->fr_cap, GFP_KERNEL);
     pdev->fr_len = 0;
 
     /* TX resources */
-    pdev->tx_buf_size = 2048;
-    pdev->tx_buf = kmalloc(pdev->tx_buf_size, GFP_KERNEL);
-    pdev->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
-    atomic_set(&pdev->tx_busy, 0);
+    spin_lock_init(&pdev->tx_lock);
+    pdev->tx_busy_map = 0;
+    for (i = 0; i < PICO_USB_TX_URB_COUNT; i++) {
+        struct pico_tx_ctx* ctx;
+        pdev->tx_bufs[i] = kmalloc(PICO_USB_TX_BUF_SIZE, GFP_KERNEL);
+        pdev->tx_urbs[i] = usb_alloc_urb(0, GFP_KERNEL);
+        if (pdev->tx_urbs[i]) {
+            // Slot context lets completion mark the right slot as free.
+            ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                ctx->pdev = pdev;
+                ctx->slot = (u8)i;
+                pdev->tx_urbs[i]->context = ctx;
+            }
+        }
+    }
+    skb_queue_head_init(&pdev->tx_skb_q);
+    pdev->tx_skb_q_limit = PICO_USB_TX_SKB_Q_LIMIT;
+    INIT_WORK(&pdev->tx_work, pico_tx_work_fn);
     spin_lock_init(&pdev->scan_lock);
     pico_scan_clear(pdev);
 
-    if (!pdev->rx_buf || !pdev->rx_urb || !pdev->fr_buf || !pdev->tx_buf || !pdev->tx_urb) {
-        dev_err(&interface->dev, DRV_NAME ": alloc failed\n");
-        if (pdev->rx_urb) usb_free_urb(pdev->rx_urb);
-        if (pdev->tx_urb) usb_free_urb(pdev->tx_urb);
-        kfree(pdev->rx_buf);
-        kfree(pdev->tx_buf);
-        kfree(pdev->fr_buf);
-        usb_put_dev(pdev->udev);
-        kfree(pdev);
-        return -ENOMEM;
+    for (i = 0; i < PICO_USB_RX_URB_COUNT; i++) {
+        if (!pdev->rx_bufs[i] || !pdev->rx_urbs[i]) {
+            dev_err(&interface->dev, DRV_NAME ": alloc failed\n");
+            goto err_alloc;
+        }
     }
+    if (!pdev->fr_buf) {
+        dev_err(&interface->dev, DRV_NAME ": alloc failed\n");
+        goto err_alloc;
+    }
+    for (i = 0; i < PICO_USB_TX_URB_COUNT; i++) {
+        if (!pdev->tx_bufs[i] || !pdev->tx_urbs[i] || !pdev->tx_urbs[i]->context) {
+            dev_err(&interface->dev, DRV_NAME ": alloc failed\n");
+            goto err_alloc;
+        }
+    }
+
+    // success
+    goto alloc_done;
+
+err_alloc:
+    pico_free_rx_resources(pdev);
+    pico_free_tx_resources(pdev);
+    kfree(pdev->fr_buf);
+    usb_put_dev(pdev->udev);
+    kfree(pdev);
+    return -ENOMEM;
+
+alloc_done:;
 
     usb_set_intfdata(interface, pdev);
 
@@ -1505,11 +2362,9 @@ static int pico_probe(struct usb_interface* interface,
     if (!pdev->netdev) {
         dev_err(&interface->dev, DRV_NAME ": netdev alloc failed\n");
         usb_put_dev(pdev->udev);
-        kfree(pdev->rx_buf);
-        kfree(pdev->tx_buf);
         kfree(pdev->fr_buf);
-        usb_free_urb(pdev->rx_urb);
-        usb_free_urb(pdev->tx_urb);
+        pico_free_rx_resources(pdev);
+        pico_free_tx_resources(pdev);
         kfree(pdev);
         return -ENOMEM;
     }
@@ -1520,22 +2375,25 @@ static int pico_probe(struct usb_interface* interface,
     pdev->netdev->netdev_ops = &pico_netdev_ops;
     pdev->netdev->mtu = 1500;
     /* No offloads; we send raw Ethernet over USB. */
-    pdev->netdev->features = 0;
+    pdev->netdev->features = NETIF_F_GRO;
     pdev->netdev->hw_features = 0;
     strscpy(pdev->netdev->name, "pico%d", IFNAMSIZ);
     eth_hw_addr_random(pdev->netdev);
     SET_NETDEV_DEV(pdev->netdev, &interface->dev);
 
+    skb_queue_head_init(&pdev->rx_skb_q);
+    pdev->rx_skb_q_limit = 1024;
+    netif_napi_add(pdev->netdev, &pdev->napi, pico_napi_poll);
+
     pdev->cfg = pico_cfg80211_init(pdev, pdev->netdev, &interface->dev);
     if (!pdev->cfg) {
         dev_err(&interface->dev, DRV_NAME ": cfg80211 init failed\n");
+        netif_napi_del(&pdev->napi);
         free_netdev(pdev->netdev);
         usb_put_dev(pdev->udev);
-        kfree(pdev->rx_buf);
-        kfree(pdev->tx_buf);
         kfree(pdev->fr_buf);
-        usb_free_urb(pdev->rx_urb);
-        usb_free_urb(pdev->tx_urb);
+        pico_free_rx_resources(pdev);
+        pico_free_tx_resources(pdev);
         kfree(pdev);
         return -ENODEV;
     }
@@ -1544,13 +2402,12 @@ static int pico_probe(struct usb_interface* interface,
         dev_err(&interface->dev, DRV_NAME ": netdev register failed\n");
         pico_cfg80211_deinit(pdev->cfg);
         pdev->cfg = NULL;
+        netif_napi_del(&pdev->napi);
         free_netdev(pdev->netdev);
         usb_put_dev(pdev->udev);
-        kfree(pdev->rx_buf);
-        kfree(pdev->tx_buf);
         kfree(pdev->fr_buf);
-        usb_free_urb(pdev->rx_urb);
-        usb_free_urb(pdev->tx_urb);
+        pico_free_rx_resources(pdev);
+        pico_free_tx_resources(pdev);
         kfree(pdev);
         return -ENODEV;
     }
@@ -1561,6 +2418,14 @@ static int pico_probe(struct usb_interface* interface,
     INIT_DELAYED_WORK(&pdev->ctrl_work, pico_ctrl_work_fn);
     pdev->ctrl_cmd = PICO_CTRL_NONE;
     pdev->ctrl_quiesce = false;
+
+    INIT_DELAYED_WORK(&pdev->perf_work, pico_perf_work_fn);
+    pdev->perf_last_usb_rx_bytes = pdev->perf_usb_rx_bytes;
+    pdev->perf_last_data_rx_bytes = pdev->perf_data_rx_bytes;
+    pdev->perf_last_data_rx_netif_drop = pdev->perf_data_rx_netif_drop;
+    pdev->perf_last_usb_tx_bytes = pdev->perf_usb_tx_bytes;
+    pdev->perf_last_usb_tx_eagain = pdev->perf_usb_tx_eagain;
+    schedule_delayed_work(&pdev->perf_work, HZ);
 
     /* Submit RX URB immediately to start receiving device responses */
     pico_kick_rx(pdev);
@@ -1583,6 +2448,10 @@ static int pico_probe(struct usb_interface* interface,
                             &pico_dbg_disconnect_fops);
         debugfs_create_file("status", 0400, pdev->dbg_dir, pdev,
                             &pico_dbg_status_fops);
+        debugfs_create_file("bench_control", 0200, pdev->dbg_dir, pdev,
+                            &pico_dbg_bench_control_fops);
+        debugfs_create_file("bench_stats", 0400, pdev->dbg_dir, pdev,
+                            &pico_dbg_bench_stats_fops);
     } else {
         dev_warn(&interface->dev, DRV_NAME ": debugfs dir create failed\n");
     }
@@ -1603,33 +2472,63 @@ static void pico_disconnect(struct usb_interface* interface) {
     if (!pdev) return;
 
     pdev->disconnected = true;
+    mutex_lock(&pdev->bench_lock);
+    pdev->bench_in_running = false;
+    pico_bench_out_stop_locked(pdev);
+    mutex_unlock(&pdev->bench_lock);
     cancel_delayed_work_sync(&pdev->ctrl_work);
+    cancel_delayed_work_sync(&pdev->perf_work);
     pdev->ctrl_cmd = PICO_CTRL_NONE;
-    if (pdev->netdev)
+    cancel_work_sync(&pdev->tx_work);
+    skb_queue_purge(&pdev->tx_skb_q);
+
+    if (pdev->netdev) {
         netif_stop_queue(pdev->netdev);
-    if (pdev->netdev)
         netif_carrier_off(pdev->netdev);
+    }
+
+    /*
+     * Stop USB I/O first to prevent RX completions racing against netdev/NAPI
+     * teardown. usb_kill_urb() waits for in-flight callbacks to finish.
+     */
 
     // stop RX
-    if (pdev->rx_urb)
-        usb_kill_urb(pdev->rx_urb);
-
-    if (pdev->rx_urb)
-        usb_free_urb(pdev->rx_urb);
+    {
+        int i;
+        for (i = 0; i < PICO_USB_RX_URB_COUNT; i++) {
+            if (pdev->rx_urbs[i])
+                usb_kill_urb(pdev->rx_urbs[i]);
+            if (pdev->rx_urbs[i])
+                usb_free_urb(pdev->rx_urbs[i]);
+            kfree(pdev->rx_bufs[i]);
+            pdev->rx_urbs[i] = NULL;
+            pdev->rx_bufs[i] = NULL;
+        }
+    }
 
     // stop TX
-    if (pdev->tx_urb)
-        usb_kill_urb(pdev->tx_urb);
-
-    if (pdev->tx_urb)
-        usb_free_urb(pdev->tx_urb);
-
-    kfree(pdev->rx_buf);
-    kfree(pdev->tx_buf);
+    {
+        int i;
+        for (i = 0; i < PICO_USB_TX_URB_COUNT; i++) {
+            if (pdev->tx_urbs[i])
+                usb_kill_urb(pdev->tx_urbs[i]);
+            if (pdev->tx_urbs[i]) {
+                kfree(pdev->tx_urbs[i]->context);
+                pdev->tx_urbs[i]->context = NULL;
+                usb_free_urb(pdev->tx_urbs[i]);
+                pdev->tx_urbs[i] = NULL;
+            }
+            kfree(pdev->tx_bufs[i]);
+            pdev->tx_bufs[i] = NULL;
+        }
+        pdev->tx_busy_map = 0;
+    }
     kfree(pdev->fr_buf);
     debugfs_remove_recursive(pdev->dbg_dir);
     if (pdev->netdev) {
         unregister_netdev(pdev->netdev);
+        /* unregister_netdev() may call ndo_stop(), which disables NAPI. */
+        netif_napi_del(&pdev->napi);
         pico_cfg80211_deinit(pdev->cfg);
         pdev->cfg = NULL;
         free_netdev(pdev->netdev);

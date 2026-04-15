@@ -1,4 +1,5 @@
 #include "wifi_mgr.h"
+#include "pwusb_perf.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -24,9 +25,13 @@ static bool g_conn_in_progress = false;
 static bool g_conn_done_sent = false;
 static uint16_t g_conn_seq = 0;
 static absolute_time_t g_conn_deadline = {0};
+static uint8_t g_conn_bssid[6] = {0};
+static uint8_t g_conn_channel = 0;
+static int8_t g_conn_rssi = 0;
 
 #define SCAN_DONE_TIMEOUT_MS 6000
 #define CONNECT_TIMEOUT_MS 15000
+#define WIFI_SCAN_MAX_RESULTS 32
 
 // Debug override: hardcode credentials for bring-up
 #define DEBUG_WIFI_CREDENTIALS 0
@@ -123,11 +128,122 @@ typedef struct __attribute__((packed)) {
     // ssid bytes follow
 } scan_result_hdr_t;
 
+typedef struct {
+    bool used;
+    uint8_t bssid[6];
+    uint8_t channel;
+    int8_t rssi;
+    uint16_t security;
+    uint8_t ssid_len;
+    uint8_t ssid[32];
+} wifi_scan_entry_t;
+
+static wifi_scan_entry_t g_scan_cache[WIFI_SCAN_MAX_RESULTS];
+static uint8_t g_scan_cache_count = 0;
+
+static void reset_scan_state_only(void) {
+    g_scan_seq = 0;
+    g_scan_in_progress = false;
+    g_scan_done_sent = false;
+    g_scan_deadline = (absolute_time_t){0};
+}
+
+static void reset_scan_cache(void) {
+    g_scan_cache_count = 0;
+    memset(g_scan_cache, 0, sizeof(g_scan_cache));
+}
+
+static void reset_connect_state(void) {
+    g_connected = false;
+    g_ssid_len = 0;
+    memset(g_ssid, 0, sizeof(g_ssid));
+    g_psk_len = 0;
+    memset(g_psk, 0, sizeof(g_psk));
+    g_key_type = PWUSB_KEY_NONE;
+
+    g_conn_in_progress = false;
+    g_conn_done_sent = false;
+    g_conn_seq = 0;
+    g_conn_deadline = (absolute_time_t){0};
+
+    memset(g_conn_bssid, 0, sizeof(g_conn_bssid));
+    g_conn_channel = 0;
+    g_conn_rssi = 0;
+}
+
+static void update_conn_meta_from_scan_cache(void) {
+    int best = -1;
+    uint8_t i;
+
+    if (g_ssid_len == 0)
+        return;
+
+    for (i = 0; i < g_scan_cache_count; i++) {
+        if (!g_scan_cache[i].used)
+            continue;
+        if (g_scan_cache[i].ssid_len != g_ssid_len)
+            continue;
+        if (memcmp(g_scan_cache[i].ssid, g_ssid, g_ssid_len) != 0)
+            continue;
+        if (best < 0 || g_scan_cache[i].rssi > g_scan_cache[best].rssi)
+            best = i;
+    }
+
+    if (best >= 0) {
+        memcpy(g_conn_bssid, g_scan_cache[best].bssid, sizeof(g_conn_bssid));
+        g_conn_channel = g_scan_cache[best].channel;
+        g_conn_rssi = g_scan_cache[best].rssi;
+    }
+}
+
+static uint16_t lookup_security_for_ssid(void) {
+    int best = -1;
+    uint8_t i;
+
+    if (g_ssid_len == 0)
+        return 0;
+
+    for (i = 0; i < g_scan_cache_count; i++) {
+        if (!g_scan_cache[i].used)
+            continue;
+        if (g_scan_cache[i].ssid_len != g_ssid_len)
+            continue;
+        if (memcmp(g_scan_cache[i].ssid, g_ssid, g_ssid_len) != 0)
+            continue;
+        if (best < 0 || g_scan_cache[i].rssi > g_scan_cache[best].rssi)
+            best = i;
+    }
+
+    if (best >= 0)
+        return g_scan_cache[best].security;
+
+    return 0;
+}
+
+static uint32_t auth_mode_from_security(uint16_t security, uint8_t psk_len) {
+    uint8_t auth_mode = (uint8_t)(security & 0xff);
+
+    if (psk_len == 0)
+        return CYW43_AUTH_OPEN;
+
+    if ((auth_mode & 0x04) && (auth_mode & 0x02))
+        return CYW43_AUTH_WPA2_MIXED_PSK;
+    if (auth_mode & 0x04)
+        return CYW43_AUTH_WPA2_AES_PSK;
+    if (auth_mode & 0x02)
+        return CYW43_AUTH_WPA_TKIP_PSK;
+
+    return CYW43_AUTH_WPA2_MIXED_PSK;
+}
+
 static void fill_status(phtm_status_rsp_t* st) {
     memset(st, 0, sizeof(*st));
     st->connected = g_connected ? 1 : 0;
     st->ssid_len = g_ssid_len;
     memcpy(st->ssid, g_ssid, g_ssid_len);
+    memcpy(st->bssid, g_conn_bssid, sizeof(st->bssid));
+    st->channel = g_conn_channel;
+    st->rssi = g_conn_rssi;
     st->reserved = 0;
 }
 
@@ -164,14 +280,26 @@ static int scan_cb(void* env, const cyw43_ev_scan_result_t* res) {
         return 0;
     }
 
+    if (g_scan_cache_count < WIFI_SCAN_MAX_RESULTS) {
+        wifi_scan_entry_t* e = &g_scan_cache[g_scan_cache_count++];
+        memset(e, 0, sizeof(*e));
+        e->used = true;
+        memcpy(e->bssid, res->bssid, 6);
+        e->channel = (uint8_t)res->channel;
+        e->rssi = (int8_t)res->rssi;
+        e->security = (uint16_t)res->auth_mode;
+        e->ssid_len = (res->ssid_len > 32) ? 32 : (uint8_t)res->ssid_len;
+        memcpy(e->ssid, res->ssid, e->ssid_len);
+    }
+
     // Build variable-length payload
     uint8_t payload[sizeof(scan_result_hdr_t) + 32];
     scan_result_hdr_t rh;
     memcpy(rh.bssid, res->bssid, 6);
     rh.channel = (uint8_t)res->channel;
     rh.rssi_dbm = (int8_t)res->rssi;
-    // Expose auth mode so the Linux cfg80211 side can advertise RSN/WPA in scan results.
-    // cyw43 scan results store auth_mode as a small code (0=open, 2=WPA-TKIP, 4=WPA2-AES, 6=WPA2 mixed).
+    // Expose CYW43 security bitmask to Linux:
+    // bit0=privacy, bit1=WPA IE present, bit2=RSN/WPA2 IE present.
     rh.security_flags = (uint16_t)res->auth_mode;
     rh.ssid_len = (res->ssid_len > 32) ? 32 : (uint8_t)res->ssid_len;
 
@@ -198,6 +326,11 @@ bool wifi_mgr_init(void) {
     cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, mac);
     printf("CYW43 MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    reset_scan_state_only();
+    reset_scan_cache();
+    reset_connect_state();
+
     return true;
 }
 
@@ -209,7 +342,7 @@ void wifi_mgr_poll(void) {
     cyw43_arch_poll();
 
     if (g_scan_in_progress && !g_scan_done_sent) {
-        if (absolute_time_diff_us(get_absolute_time(), g_scan_deadline) <= 0) {
+        if (time_reached(g_scan_deadline)) {
             uint32_t st = 0;
             enqueue_msg_force(PWUSB_EVT_SCAN_DONE, g_scan_seq, &st, sizeof(st));
             g_scan_done_sent = true;
@@ -217,14 +350,65 @@ void wifi_mgr_poll(void) {
         }
     }
 
+    /*
+     * Connection progress is asynchronous.
+     *
+     * We must NOT block the main loop inside wifi_mgr_connect(), otherwise USB
+     * service and other tasks stall and the adapter "feels unresponsive".
+     */
     if (g_conn_in_progress && !g_conn_done_sent) {
         phtm_status_rsp_t st;
-        g_connected = false;
-        fill_status(&st);
-        st.reserved = 1;  // timeout
-        enqueue_msg_force(PWUSB_EVT_CONN_STATE, g_conn_seq, &st, sizeof(st));
-        g_conn_done_sent = true;
-        g_conn_in_progress = false;
+        int link_st;
+
+        link_st = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+        if (link_st == CYW43_LINK_JOIN ||
+            link_st == CYW43_LINK_NOIP ||
+            link_st == CYW43_LINK_UP) {
+            g_connected = true;
+            g_conn_in_progress = false;
+            g_conn_done_sent = true;
+
+            update_conn_meta_from_scan_cache();
+
+            fill_status(&st);
+            st.reserved = 0;
+            if (PWUSB_WIFI_DEBUG) {
+                printf("CONN_STATE send: seq=%u connected=1 ssid_len=%u st=0\n",
+                       (unsigned)g_conn_seq, (unsigned)st.ssid_len);
+            }
+            enqueue_msg_force(PWUSB_EVT_CONN_STATE, g_conn_seq, &st, sizeof(st));
+            return;
+        }
+
+        if (link_st < 0) {
+            g_connected = false;
+            g_conn_in_progress = false;
+            g_conn_done_sent = true;
+            fill_status(&st);
+            st.reserved = (uint16_t)link_st;
+            if (PWUSB_WIFI_DEBUG) {
+                printf("CONN_STATE send: seq=%u connected=0 ssid_len=%u st=%d\n",
+                       (unsigned)g_conn_seq, (unsigned)st.ssid_len, link_st);
+            }
+            enqueue_msg_force(PWUSB_EVT_CONN_STATE, g_conn_seq, &st, sizeof(st));
+            return;
+        }
+
+        if (time_reached(g_conn_deadline)) {
+            g_connected = false;
+            g_conn_in_progress = false;
+            g_conn_done_sent = true;
+            fill_status(&st);
+            st.reserved = (uint16_t)PICO_ERROR_TIMEOUT;
+            if (PWUSB_WIFI_DEBUG) {
+                printf("CONN_STATE send: seq=%u connected=0 ssid_len=%u st=timeout\n",
+                       (unsigned)g_conn_seq, (unsigned)st.ssid_len);
+            }
+            enqueue_msg_force(PWUSB_EVT_CONN_STATE, g_conn_seq, &st, sizeof(st));
+            /* Best-effort: cancel the in-flight attempt. */
+            (void)cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+            return;
+        }
     }
 }
 
@@ -258,6 +442,8 @@ bool wifi_mgr_send_ethernet(const uint8_t* buf, uint16_t len) {
 
 bool wifi_mgr_scan_start(msg_queue_t* txq, uint16_t seq) {
     g_txq = txq;
+    reset_scan_state_only();
+    reset_scan_cache();
     g_scan_seq = seq;
     g_scan_in_progress = true;
     g_scan_done_sent = false;
@@ -269,6 +455,7 @@ bool wifi_mgr_scan_start(msg_queue_t* txq, uint16_t seq) {
     if (err) {
         uint32_t st = (uint32_t)err;
         enqueue_msg_force(PWUSB_EVT_ERROR, seq, &st, sizeof(st));
+        enqueue_msg_force(PWUSB_EVT_SCAN_DONE, seq, &st, sizeof(st));
         g_scan_in_progress = false;
         g_scan_done_sent = true;
         return false;
@@ -284,9 +471,11 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
                       uint8_t key_type) {
     phtm_status_rsp_t st;
     int err;
+    uint16_t security;
+    uint32_t auth_mode;
 
     g_txq = txq;
-    g_conn_seq = seq;
+    reset_connect_state();
 #if DEBUG_WIFI_CREDENTIALS
     g_ssid_len = strlen(DEBUG_WIFI_SSID);
     g_psk_len = strlen(DEBUG_WIFI_PSK);
@@ -307,6 +496,8 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
     g_key_type = (key_type <= PWUSB_KEY_PMK) ? key_type : PWUSB_KEY_NONE;
 #endif
 
+    g_conn_seq = seq;
+
     if (PWUSB_WIFI_DEBUG) {
         char psk_mask[80];
         if (g_key_type == PWUSB_KEY_PMK) {
@@ -324,11 +515,18 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
     g_conn_deadline = make_timeout_time_ms(CONNECT_TIMEOUT_MS);
 
     cyw43_ll_set_pmk_mode(&cyw43_state.cyw43_ll, g_key_type == PWUSB_KEY_PMK);
+    security = lookup_security_for_ssid();
+    auth_mode = auth_mode_from_security(security, g_psk_len);
+
+    /* Cancel any prior connection attempt. */
+    (void)cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    sleep_ms(100);
+    g_connected = false;
 
     if (g_psk_len) {
         err = cyw43_wifi_join(&cyw43_state, g_ssid_len, g_ssid,
                               g_psk_len, g_psk,
-                              CYW43_AUTH_WPA2_MIXED_PSK,
+                              auth_mode,
                               NULL, CYW43_CHANNEL_NONE);
     } else {
         err = cyw43_wifi_join(&cyw43_state, g_ssid_len, g_ssid,
@@ -337,44 +535,28 @@ bool wifi_mgr_connect(msg_queue_t* txq, uint16_t seq,
                               NULL, CYW43_CHANNEL_NONE);
     }
 
-    if (err == 0) {
-        while (!time_reached(g_conn_deadline)) {
-            int st = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
-            if (st == CYW43_LINK_JOIN) {
-                g_connected = true;
-                err = 0;
-                break;
-            }
-            if (st < 0) {
-                err = st;
-                break;
-            }
-            cyw43_arch_poll();
-            sleep_ms(10);
-        }
-        if (!g_connected && err == 0 && time_reached(g_conn_deadline))
-            err = PICO_ERROR_TIMEOUT;
+    if (PWUSB_WIFI_DEBUG) {
+        printf("CONNECT start: seq=%u rc=%d ssid_len=%u\n",
+               (unsigned)seq, err, (unsigned)g_ssid_len);
     }
 
-    if (g_connected) {
-        // Register broadcast MAC to ensure BC frames reach us
-        // DHCP replies are sent as broadcast (FF:FF:FF:FF:FF:FF) or unicast (always accepted)
-        // No need to register multicast groups since DHCP uses broadcast/unicast only
-        uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-        cyw43_wifi_update_multicast_filter(&cyw43_state, bcast, true);
+    if (err) {
         if (PWUSB_WIFI_DEBUG)
-            printf("multicast filter: allow broadcast (for DHCP OFFER/ACK)\n");
+            printf("CONNECT start failed rc=%d\n", err);
+
+        g_conn_in_progress = false;
+        g_conn_done_sent = true;
+        fill_status(&st);
+        st.reserved = (uint16_t)err;
+        enqueue_msg_force(PWUSB_EVT_CONN_STATE, seq, &st, sizeof(st));
+        return false;
     }
 
-    if (PWUSB_WIFI_DEBUG)
-        printf("CONNECT rc=%d\n", err);
-
-    g_conn_in_progress = false;
-    g_conn_done_sent = true;
-    fill_status(&st);
-    st.reserved = (uint16_t)err;
-    enqueue_msg_force(PWUSB_EVT_CONN_STATE, seq, &st, sizeof(st));
-    return g_connected;
+    /*
+     * Connection completion is reported from wifi_mgr_poll() once the link
+     * reaches CYW43_LINK_JOIN (or errors / times out).
+     */
+    return true;
 }
 
 bool wifi_mgr_disconnect(msg_queue_t* txq, uint16_t seq) {
@@ -382,10 +564,9 @@ bool wifi_mgr_disconnect(msg_queue_t* txq, uint16_t seq) {
     int err = 0;
 
     g_txq = txq;
-    g_conn_in_progress = false;
-    g_conn_done_sent = true;
     err = cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
-    g_connected = false;
+    sleep_ms(100);
+    reset_connect_state();
 
     fill_status(&st);
     st.reserved = (uint16_t)err;
@@ -415,7 +596,11 @@ void cyw43_cb_process_ethernet(void* cb_data, int itf, size_t len, const uint8_t
     (void)itf;
 
     if (!g_txq || !buf || len == 0) return;
-    if (len > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) return;
+    pwusb_perf_wifi_rx(len);
+    if (len > (MQ_MAX_MSG - sizeof(pwusb_hdr_t))) {
+        pwusb_perf_wifi_rx_drop_oversize();
+        return;
+    }
 
     if (PWUSB_WIFI_DEBUG && rx_dbg < 10) {
         uint16_t et = (uint16_t)(buf[12] << 8 | buf[13]);
@@ -451,6 +636,7 @@ void cyw43_cb_process_ethernet(void* cb_data, int itf, size_t len, const uint8_t
         if (!mq_drop(g_txq))
             break;
     }
+    pwusb_perf_wifi_rx_drop_qfull();
     if (PWUSB_WIFI_DEBUG && push_fail_dbg < 5) {
         printf("RX enqueue drop len=%u (queue full)\n", (unsigned)len);
         push_fail_dbg++;

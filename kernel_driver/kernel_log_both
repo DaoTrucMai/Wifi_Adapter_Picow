@@ -1,0 +1,6 @@
+2026-04-15T15:29:46,006462+00:00 pico_usb_wifi 1-2:1.0: pico_usb_wifi: <- SCAN_DONE seq=21097 plen=4
+2026-04-15T15:29:54,889985+00:00 pico_usb_wifi 1-2:1.0: pico_usb_wifi: SCAN_START sent (seq=21112)
+2026-04-15T15:30:02,036288+00:00 pico_usb_wifi 1-2:1.0: pico_usb_wifi: <- SCAN_DONE seq=21112 plen=4
+2026-04-15T15:30:09,887327+00:00 pico_usb_wifi 1-2:1.0: pico_usb_wifi: SCAN_START sent (seq=21138)
+2026-04-15T15:30:17,040691+00:00 pico_usb_wifi 1-2:1.0: pico_usb_wifi: <- SCAN_DONE seq=21138 plen=4
+2026-04-15T15:30:24,880175+00:00 pico_usb_wifi 1-2:1.0: pico_usb_wifi: SCAN_START sent (seq=21145)

@@ -16,12 +16,20 @@ enum pwusb_msg_type {
     PWUSB_CMD_DISCONNECT = 0x13,
     PWUSB_CMD_GET_STATUS = 0x14,
 
+    // USB throughput benchmark helpers (no Wi-Fi involvement)
+    PWUSB_CMD_BENCH_START = 0x20,
+    PWUSB_CMD_BENCH_STOP = 0x21,
+
     PWUSB_EVT_SCAN_RESULT = 0x90,
     PWUSB_EVT_SCAN_DONE = 0x91,
     PWUSB_EVT_CONN_STATE = 0x92,
     PWUSB_EVT_STATUS = 0x93,
     PWUSB_DATA_TX_ETH = 0xA0,
     PWUSB_DATA_RX_ETH = 0xA1,
+
+    // Bench data plane
+    PWUSB_DATA_BENCH_SINK = 0xB0,   // host -> device (device counts + discards)
+    PWUSB_DATA_BENCH_SRC = 0xB1,    // device -> host (host counts + discards)
     PWUSB_EVT_ERROR = 0xFF,
 };
 

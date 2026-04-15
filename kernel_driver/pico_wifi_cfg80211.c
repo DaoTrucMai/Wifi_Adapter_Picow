@@ -5,6 +5,16 @@
 #include <linux/version.h>
 #include <net/cfg80211.h>
 
+/*
+ * cfg80211_ops key callbacks gained a `link_id` argument in newer kernels.
+ * Keep compatibility with both Ubuntu 5.15 and Raspberry Pi OS 6.6.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+#define PICO_CFG80211_HAS_LINK_ID 1
+#else
+#define PICO_CFG80211_HAS_LINK_ID 0
+#endif
+
 struct pico_cfg80211 {
     struct wiphy* wiphy;
     struct wireless_dev* wdev;
@@ -303,6 +313,8 @@ static int pico_cfg80211_disconnect(struct wiphy* wiphy, struct net_device* dev,
     cfg->disconnect_requested = true;
     spin_unlock_bh(&cfg->lock);
 
+    pico_cfg80211_scan_done(cfg, true);
+
     ret = pico_ctrl_disconnect(cfg->pdev);
     if (ret)
         return ret;
@@ -328,11 +340,20 @@ static int pico_cfg80211_get_station(struct wiphy* wiphy, struct net_device* dev
     return 0;
 }
 
+#if PICO_CFG80211_HAS_LINK_ID
+static int pico_cfg80211_add_key(struct wiphy* wiphy, struct net_device* dev,
+                                 int link_id, u8 key_index, bool pairwise,
+                                 const u8* mac_addr, struct key_params* params) {
+#else
 static int pico_cfg80211_add_key(struct wiphy* wiphy, struct net_device* dev,
                                  u8 key_index, bool pairwise,
                                  const u8* mac_addr, struct key_params* params) {
+#endif
     (void)wiphy;
     (void)dev;
+#if PICO_CFG80211_HAS_LINK_ID
+    (void)link_id;
+#endif
     (void)key_index;
     (void)pairwise;
     (void)mac_addr;
@@ -345,31 +366,57 @@ static int pico_cfg80211_add_key(struct wiphy* wiphy, struct net_device* dev,
     return 0;
 }
 
+#if PICO_CFG80211_HAS_LINK_ID
+static int pico_cfg80211_del_key(struct wiphy* wiphy, struct net_device* dev,
+                                 int link_id, u8 key_index, bool pairwise,
+                                 const u8* mac_addr) {
+#else
 static int pico_cfg80211_del_key(struct wiphy* wiphy, struct net_device* dev,
                                  u8 key_index, bool pairwise,
                                  const u8* mac_addr) {
+#endif
     (void)wiphy;
     (void)dev;
+#if PICO_CFG80211_HAS_LINK_ID
+    (void)link_id;
+#endif
     (void)key_index;
     (void)pairwise;
     (void)mac_addr;
     return 0;
 }
 
+#if PICO_CFG80211_HAS_LINK_ID
+static int pico_cfg80211_set_default_key(struct wiphy* wiphy, struct net_device* dev,
+                                         int link_id, u8 key_index, bool unicast,
+                                         bool multicast) {
+#else
 static int pico_cfg80211_set_default_key(struct wiphy* wiphy, struct net_device* dev,
                                          u8 key_index, bool unicast, bool multicast) {
+#endif
     (void)wiphy;
     (void)dev;
+#if PICO_CFG80211_HAS_LINK_ID
+    (void)link_id;
+#endif
     (void)key_index;
     (void)unicast;
     (void)multicast;
     return 0;
 }
 
+#if PICO_CFG80211_HAS_LINK_ID
+static int pico_cfg80211_set_default_mgmt_key(struct wiphy* wiphy, struct net_device* dev,
+                                              int link_id, u8 key_index) {
+#else
 static int pico_cfg80211_set_default_mgmt_key(struct wiphy* wiphy, struct net_device* dev,
                                               u8 key_index) {
+#endif
     (void)wiphy;
     (void)dev;
+#if PICO_CFG80211_HAS_LINK_ID
+    (void)link_id;
+#endif
     (void)key_index;
     return 0;
 }
@@ -442,6 +489,9 @@ struct pico_cfg80211* pico_cfg80211_init(struct pico_dev* pdev,
     SET_NETDEV_DEV(ndev, wiphy_dev(wiphy));
 
     if (wiphy_register(wiphy)) {
+        /* Avoid leaving a dangling netdev->ieee80211_ptr on init failure. */
+        if (ndev->ieee80211_ptr == wdev)
+            ndev->ieee80211_ptr = NULL;
         kfree(wdev);
         wiphy_free(wiphy);
         return NULL;
@@ -461,11 +511,91 @@ void pico_cfg80211_deinit(struct pico_cfg80211* cfg) {
     if (cfg->wiphy)
         wiphy_unregister(cfg->wiphy);
 
-    if (cfg->wdev)
+    if (cfg->wdev) {
+        /*
+         * cfg80211 stores wdev on netdev->ieee80211_ptr. Make sure we don't
+         * leave a dangling pointer after teardown (can be dereferenced by
+         * nl80211/cfg80211 during or after disconnect races).
+         */
+        if (cfg->wdev->netdev && cfg->wdev->netdev->ieee80211_ptr == cfg->wdev)
+            cfg->wdev->netdev->ieee80211_ptr = NULL;
         kfree(cfg->wdev);
+        cfg->wdev = NULL;
+    }
 
     if (cfg->wiphy)
         wiphy_free(cfg->wiphy);
+}
+
+#define PICO_SCAN_SEC_CACHE_MAX 64
+
+struct pico_scan_sec_entry {
+    bool valid;
+    u8 bssid[ETH_ALEN];
+    u8 ssid[32];
+    u8 ssid_len;
+    u16 security;
+};
+
+static struct pico_scan_sec_entry g_pico_scan_sec_cache[PICO_SCAN_SEC_CACHE_MAX];
+
+static void pico_scan_sec_cache_store(const u8* bssid, const u8* ssid,
+                                      u8 ssid_len, u16 security) {
+    int i;
+    int free_idx = -1;
+
+    for (i = 0; i < PICO_SCAN_SEC_CACHE_MAX; i++) {
+        if (!g_pico_scan_sec_cache[i].valid) {
+            if (free_idx < 0)
+                free_idx = i;
+            continue;
+        }
+
+        if (memcmp(g_pico_scan_sec_cache[i].bssid, bssid, ETH_ALEN) == 0) {
+            memcpy(g_pico_scan_sec_cache[i].ssid, ssid, ssid_len);
+            g_pico_scan_sec_cache[i].ssid_len = ssid_len;
+            g_pico_scan_sec_cache[i].security = security;
+            return;
+        }
+    }
+
+    if (free_idx >= 0) {
+        g_pico_scan_sec_cache[free_idx].valid = true;
+        memcpy(g_pico_scan_sec_cache[free_idx].bssid, bssid, ETH_ALEN);
+        memcpy(g_pico_scan_sec_cache[free_idx].ssid, ssid, ssid_len);
+        g_pico_scan_sec_cache[free_idx].ssid_len = ssid_len;
+        g_pico_scan_sec_cache[free_idx].security = security;
+    }
+}
+
+static u16 pico_scan_sec_cache_lookup(const u8* bssid, const u8* ssid, u8 ssid_len) {
+    int i;
+
+    for (i = 0; i < PICO_SCAN_SEC_CACHE_MAX; i++) {
+        if (!g_pico_scan_sec_cache[i].valid)
+            continue;
+
+        if (memcmp(g_pico_scan_sec_cache[i].bssid, bssid, ETH_ALEN) == 0)
+            return g_pico_scan_sec_cache[i].security;
+
+        if (g_pico_scan_sec_cache[i].ssid_len == ssid_len &&
+            memcmp(g_pico_scan_sec_cache[i].ssid, ssid, ssid_len) == 0)
+            return g_pico_scan_sec_cache[i].security;
+    }
+
+    return 0;
+}
+
+static bool pico_auth_requires_privacy(u8 auth_mode) {
+    return auth_mode != 0;
+}
+
+static bool pico_auth_has_wpa(u8 auth_mode) {
+    return (auth_mode & 0x02) != 0;
+}
+
+static bool pico_auth_has_wpa2(u8 auth_mode) {
+    return (auth_mode & 0x04) != 0;
 }
 
 void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
@@ -475,15 +605,22 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
                                       u16 security,
                                       const char* ssid,
                                       u8 ssid_len) {
-    struct ieee80211_channel* chan;
     struct cfg80211_inform_bss data = {};
+    struct ieee80211_channel* chan;
     struct cfg80211_bss* bss;
     int freq;
     u16 capability = WLAN_CAPABILITY_ESS;
     u8 auth_mode = (u8)(security & 0xff);
+    u8 ie[96];
+    size_t ie_len = 0;
 
-    if (!cfg || !cfg->wiphy)
+    if (!cfg || !cfg->wiphy || !bssid || !ssid || ssid_len == 0)
         return;
+
+    if (ssid_len > 32)
+        ssid_len = 32;
+
+    pico_scan_sec_cache_store(bssid, (const u8*)ssid, ssid_len, security);
 
     freq = ieee80211_channel_to_frequency(channel, NL80211_BAND_2GHZ);
     chan = ieee80211_get_channel(cfg->wiphy, freq);
@@ -494,92 +631,46 @@ void pico_cfg80211_report_scan_result(struct pico_cfg80211* cfg,
     data.signal = (s32)rssi * 100;
     data.boottime_ns = ktime_get_boottime_ns();
 
-    {
-        /* SSID IE + optional RSN/WPA IE */
-        u8 ie[2 + 32 + 2 + 24];
-        size_t ie_len = 0;
-        bool privacy = (auth_mode & 0x01) != 0;
+    ie[ie_len++] = WLAN_EID_SSID;
+    ie[ie_len++] = ssid_len;
+    memcpy(ie + ie_len, ssid, ssid_len);
+    ie_len += ssid_len;
 
-        if (ssid_len > 32)
-            ssid_len = 32;
-        ie[0] = WLAN_EID_SSID;
-        ie[1] = ssid_len;
-        if (ssid_len)
-            memcpy(&ie[2], ssid, ssid_len);
-        ie_len = 2 + ssid_len;
+    if (pico_auth_requires_privacy(auth_mode))
+        capability |= WLAN_CAPABILITY_PRIVACY;
 
-        if (privacy)
-            capability |= WLAN_CAPABILITY_PRIVACY;
-
-        /*
-         * Firmware scan results only provide a compact auth code.
-         * Map the common cases so wpa_supplicant can select WPA/WPA2 networks.
-         */
-        if (auth_mode & 0x04) {
-            /* WPA2-PSK-CCMP RSN IE (minimal) */
-            static const u8 rsn_ie[] = {
-                WLAN_EID_RSN,
-                20,
-                0x01,
-                0x00, /* Version 1 */
-                0x00,
-                0x0f,
-                0xac,
-                0x04, /* Group cipher: CCMP */
-                0x01,
-                0x00, /* Pairwise cipher count */
-                0x00,
-                0x0f,
-                0xac,
-                0x04, /* Pairwise cipher: CCMP */
-                0x01,
-                0x00, /* AKM count */
-                0x00,
-                0x0f,
-                0xac,
-                0x02, /* AKM: PSK */
-                0x00,
-                0x00, /* RSN capabilities */
-            };
-            memcpy(ie + ie_len, rsn_ie, sizeof(rsn_ie));
-            ie_len += sizeof(rsn_ie);
-        } else if (auth_mode & 0x02) {
-            /* WPA-PSK-TKIP vendor IE (minimal) */
-            static const u8 wpa_ie[] = {
-                WLAN_EID_VENDOR_SPECIFIC,
-                22,
-                0x00,
-                0x50,
-                0xf2,
-                0x01, /* OUI + type */
-                0x01,
-                0x00, /* Version 1 */
-                0x00,
-                0x50,
-                0xf2,
-                0x02, /* Group cipher: TKIP */
-                0x01,
-                0x00, /* Pairwise cipher count */
-                0x00,
-                0x50,
-                0xf2,
-                0x02, /* Pairwise cipher: TKIP */
-                0x01,
-                0x00, /* AKM count */
-                0x00,
-                0x50,
-                0xf2,
-                0x02, /* AKM: PSK */
-            };
-            memcpy(ie + ie_len, wpa_ie, sizeof(wpa_ie));
-            ie_len += sizeof(wpa_ie);
-        }
-
-        bss = cfg80211_inform_bss_data(cfg->wiphy, &data,
-                                       CFG80211_BSS_FTYPE_PRESP,
-                                       bssid, 0, capability, 100,
-                                       ie, ie_len, GFP_ATOMIC);
+    if (pico_auth_has_wpa2(auth_mode)) {
+        static const u8 rsn_ie[] = {
+            WLAN_EID_RSN, 20,
+            0x01, 0x00,
+            0x00, 0x0f, 0xac, 0x04,
+            0x01, 0x00,
+            0x00, 0x0f, 0xac, 0x04,
+            0x01, 0x00,
+            0x00, 0x0f, 0xac, 0x02,
+            0x00, 0x00,
+        };
+        memcpy(ie + ie_len, rsn_ie, sizeof(rsn_ie));
+        ie_len += sizeof(rsn_ie);
+    } else if (pico_auth_has_wpa(auth_mode)) {
+        static const u8 wpa_ie[] = {
+            WLAN_EID_VENDOR_SPECIFIC, 22,
+            0x00, 0x50, 0xf2, 0x01,
+            0x01, 0x00,
+            0x00, 0x50, 0xf2, 0x02,
+            0x01, 0x00,
+            0x00, 0x50, 0xf2, 0x02,
+            0x01, 0x00,
+            0x00, 0x50, 0xf2, 0x02,
+        };
+        memcpy(ie + ie_len, wpa_ie, sizeof(wpa_ie));
+        ie_len += sizeof(wpa_ie);
     }
+
+    bss = cfg80211_inform_bss_data(cfg->wiphy, &data,
+                                   CFG80211_BSS_FTYPE_PRESP,
+                                   bssid, 0, capability, 100,
+                                   ie, ie_len, GFP_ATOMIC);
     if (bss)
         cfg80211_put_bss(cfg->wiphy, bss);
 }
@@ -620,7 +711,9 @@ void pico_cfg80211_conn_state(struct pico_cfg80211* cfg,
     spin_unlock_bh(&cfg->lock);
 
     if (connected && !is_zero_ether_addr(bssid) && channel > 0) {
-        pico_cfg80211_report_scan_result(cfg, bssid, channel, rssi, 0,
+        u16 security = pico_scan_sec_cache_lookup(bssid, (const u8*)ssid, ssid_len);
+
+        pico_cfg80211_report_scan_result(cfg, bssid, channel, rssi, security,
                                          ssid, ssid_len);
     }
 

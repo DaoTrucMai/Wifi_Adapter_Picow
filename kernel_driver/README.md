@@ -155,6 +155,8 @@ sudo mount -t debugfs none /sys/kernel/debug
 - connect (write-only): connect using "ssid" or "ssid:psk"
 - disconnect (write-only): disconnect by writing "1"
 - status (read-only): cached connection status (also triggers a status request)
+- bench_control (write-only): start/stop raw USB throughput benchmarks (IN/OUT/both)
+- bench_stats (read-only): benchmark results (bytes, time, Mb/s)
 
 ### Examples
 Trigger scan:
@@ -177,6 +179,36 @@ echo 1 | sudo tee /sys/kernel/debug/pico_usb_wifi/disconnect
 
 Status:
 sudo cat /sys/kernel/debug/pico_usb_wifi/status
+
+## DebugFS (USB benchmark)
+These commands measure the raw USB transport throughput independent of Wi-Fi/TCP.
+
+Notes:
+- Run as root (debugfs).
+- `plen` is the payload size per synthetic message/frame. The device caps it to
+  its `dev_max_total` (see `bench_stats`).
+- `in` = device -> host only (best case).
+- `out` = host -> device only (device discards payload as fast as possible).
+- `both` = full duplex (IN+OUT compete for USB Full-Speed time).
+
+Reset counters / stop any running benchmark:
+echo stop  | sudo tee /sys/kernel/debug/pico_usb_wifi/bench_control
+echo reset | sudo tee /sys/kernel/debug/pico_usb_wifi/bench_control
+
+Device -> host (download direction) benchmark:
+echo "in 2032" | sudo tee /sys/kernel/debug/pico_usb_wifi/bench_control
+sleep 15
+sudo cat /sys/kernel/debug/pico_usb_wifi/bench_stats
+
+Host -> device (upload direction) benchmark:
+echo "out 2032" | sudo tee /sys/kernel/debug/pico_usb_wifi/bench_control
+sleep 15
+sudo cat /sys/kernel/debug/pico_usb_wifi/bench_stats
+
+Full duplex benchmark:
+echo "both 2032" | sudo tee /sys/kernel/debug/pico_usb_wifi/bench_control
+sleep 15
+sudo cat /sys/kernel/debug/pico_usb_wifi/bench_stats
 
 ## Bring-up (DHCP + ping)
 After `connect`, the driver registers a netdev named `pico0` (or `pico1`, ...).
